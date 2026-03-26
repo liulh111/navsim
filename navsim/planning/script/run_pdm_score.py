@@ -21,7 +21,7 @@ from omegaconf import DictConfig
 from navsim.agents.abstract_agent import AbstractAgent
 from navsim.common.dataclasses import PDMResults, SensorConfig
 from navsim.common.dataloader import MetricCacheLoader, SceneFilter, SceneLoader
-from navsim.common.enums import SceneFrameType
+from navsim.common.enums import BoundingBoxIndex, SceneFrameType
 from navsim.evaluate.pdm_score import pdm_score
 from navsim.planning.script.builders.worker_pool_builder import build_worker
 from navsim.planning.simulation.planner.pdm_planner.scoring.pdm_scorer import PDMScorer
@@ -31,6 +31,236 @@ from navsim.planning.simulation.planner.pdm_planner.utils.pdm_enums import Weigh
 from navsim.traffic_agents_policies.abstract_traffic_agents_policy import AbstractTrafficAgentsPolicy
 
 logger = logging.getLogger(__name__)
+
+
+def _extract_whitebox_features(scene, token: str, log: logging.Logger) -> bool:
+    """
+    Extract and log a *probe* of the Waymo whitebox features from a navsim Scene.
+    Fires once per worker (caller flips a flag after the first call).
+
+    Confirmed from run output:
+      - ego_status.ego_pose is a numpy array [x, y, heading], NOT StateSE2
+      - ego_status.ego_velocity is a numpy array (2- or 3-element)
+    """
+    frame_idx = scene.scene_metadata.num_history_frames - 1
+    ego_status = scene.frames[frame_idx].ego_status
+    annotations = scene.frames[frame_idx].annotations
+
+    # ego_pose is a raw ndarray [x, y, heading] — NOT a StateSE2 object
+    ego_pose_arr = ego_status.ego_pose          # shape (3,)
+    ego_x       = float(ego_pose_arr[0])
+    ego_y       = float(ego_pose_arr[1])
+    ego_heading = float(ego_pose_arr[2])
+
+    # ── 1. ego-LocalEgoState (1×6) ───────────────────────────────────────────
+    speed = float(np.linalg.norm(ego_status.ego_velocity))
+
+    try:
+        from nuplan.common.actor_state.vehicle_parameters import get_pacifica_parameters
+        params = get_pacifica_parameters()
+        vehicle_length = float(params.length)
+        vehicle_width  = float(params.width)
+    except Exception:
+        vehicle_length, vehicle_width = 5.176, 2.297  # confirmed constants from run
+
+    trajectory = scene.get_future_trajectory(
+        num_trajectory_frames=scene.scene_metadata.num_future_frames
+    )
+    rel_goal_x = float(trajectory.poses[-1, 0])
+    rel_goal_y = float(trajectory.poses[-1, 1])
+    is_collided = 0  # not available from raw scene data
+
+    ego_state = np.array([[speed, vehicle_length, vehicle_width,
+                           rel_goal_x, rel_goal_y, is_collided]])  # (1, 6)
+
+    # ── 2. partner_state (2×6 probe) ─────────────────────────────────────────
+    N = annotations.boxes.shape[0]
+    probe_n = min(2, N)
+    if probe_n > 0:
+        partner_state_probe = np.stack([
+            np.linalg.norm(annotations.velocity_3d[:probe_n, :2], axis=1),
+            annotations.boxes[:probe_n, BoundingBoxIndex.X],
+            annotations.boxes[:probe_n, BoundingBoxIndex.Y],
+            annotations.boxes[:probe_n, BoundingBoxIndex.HEADING],
+            annotations.boxes[:probe_n, BoundingBoxIndex.LENGTH],
+            annotations.boxes[:probe_n, BoundingBoxIndex.WIDTH],
+        ], axis=1)  # (probe_n, 6)
+    else:
+        partner_state_probe = np.zeros((0, 6), dtype=np.float32)
+
+    # ── 3. LocalRoadState (2×13 probe) ───────────────────────────────────────
+    road_rows = []
+    road_debug_lines = []   # per-layer diagnostics, always printed
+    try:
+        from nuplan.common.maps.maps_datatypes import SemanticMapLayer
+        from nuplan.common.actor_state.state_representation import Point2D
+
+        query_point = Point2D(ego_x, ego_y)
+
+        # SPEED_BUMP may be unavailable in some map versions — query separately
+        # so a missing layer doesn't suppress results from the others
+        layers_always = [
+            SemanticMapLayer.LANE,
+            SemanticMapLayer.LANE_CONNECTOR,
+            SemanticMapLayer.ROADBLOCK,
+            SemanticMapLayer.CROSSWALK,
+            SemanticMapLayer.STOP_LINE,
+        ]
+        layers_optional = [SemanticMapLayer.SPEED_BUMP]
+        layer_onehot = {
+            SemanticMapLayer.LANE:           3,
+            SemanticMapLayer.LANE_CONNECTOR: 3,
+            SemanticMapLayer.ROADBLOCK:      2,
+            SemanticMapLayer.CROSSWALK:      4,
+            SemanticMapLayer.SPEED_BUMP:     5,
+            SemanticMapLayer.STOP_LINE:      6,
+        }
+        map_objects = scene.map_api.get_proximal_map_objects(
+            point=query_point, radius=50.0, layers=layers_always
+        )
+        try:
+            opt_objs = scene.map_api.get_proximal_map_objects(
+                point=query_point, radius=50.0, layers=layers_optional
+            )
+            map_objects.update(opt_objs)
+        except Exception as _opt_e:
+            road_debug_lines.append(f"  optional layers skipped: {_opt_e}")
+
+        cos_h = np.cos(-ego_heading)
+        sin_h = np.sin(-ego_heading)
+
+        for layer, objs in map_objects.items():
+            layer_name = layer.name
+            road_debug_lines.append(
+                f"  layer {layer_name}: {len(objs)} object(s) found"
+            )
+            for obj_idx, obj in enumerate(objs[:3]):  # inspect up to 3 per layer
+                obj_attrs = [a for a in ("baseline_path", "polygon", "exterior")
+                             if hasattr(obj, a)]
+                road_debug_lines.append(
+                    f"    obj[{obj_idx}] type={type(obj).__name__}  "
+                    f"has_attrs={obj_attrs}"
+                )
+                if len(road_rows) >= 2:
+                    continue  # keep logging even after we have 2 rows
+
+                # ── try baseline_path first (Lane / LaneConnector) ──
+                geom_src = None
+                seg_width = 0.0
+                try:
+                    ls = obj.baseline_path.linestring
+                    coords = np.array(ls.coords)
+                    geom_src = "baseline_path"
+                    seg_len = float(ls.length) / max(len(coords) - 1, 1)
+                    try:
+                        seg_width = float(obj.width_at_point(
+                            ls.interpolate(0.5, normalized=True)
+                        ))
+                    except Exception as _we:
+                        road_debug_lines.append(
+                            f"      width_at_point failed: {type(_we).__name__}({_we})"
+                        )
+                except Exception as _bp_e:
+                    road_debug_lines.append(
+                        f"      baseline_path failed: {type(_bp_e).__name__}({_bp_e})"
+                    )
+                    # ── fallback: polygon exterior (RoadBlock / CrossWalk / StopLine) ──
+                    try:
+                        poly = obj.polygon
+                        ext = np.array(poly.exterior.coords)  # (M, 2)
+                        # use polygon exterior as coords; seg_len = perimeter / num_segments
+                        coords = ext
+                        seg_len = float(poly.length) / max(len(ext) - 1, 1)
+                        # approximate width from bounding-box minor axis
+                        bb_w = float(poly.minimum_rotated_rectangle.exterior.length) / 4
+                        seg_width = bb_w
+                        geom_src = "polygon"
+                    except Exception as _pg_e:
+                        road_debug_lines.append(
+                            f"      polygon fallback also failed: "
+                            f"{type(_pg_e).__name__}({_pg_e})"
+                        )
+                        continue
+
+                # ── global → ego-local transform ──
+                dx = coords[:, 0] - ego_x
+                dy = coords[:, 1] - ego_y
+                lx =  dx * cos_h - dy * sin_h
+                ly =  dx * sin_h + dy * cos_h
+                cx, cy = float(np.mean(lx)), float(np.mean(ly))
+                seg_height = 0.0  # 2-D map
+                orientation = (
+                    float(np.arctan2(coords[1, 1] - coords[0, 1],
+                                      coords[1, 0] - coords[0, 0])) - ego_heading
+                    if len(coords) >= 2 else 0.0
+                )
+                type_onehot = [0] * 7
+                type_onehot[layer_onehot.get(layer, 0)] = 1
+                road_rows.append(
+                    [cx, cy, seg_len, seg_width, seg_height, orientation]
+                    + type_onehot
+                )
+                road_debug_lines.append(
+                    f"      -> SUCCESS via {geom_src}: "
+                    f"cx={cx:.3f} cy={cy:.3f} seg_len={seg_len:.3f} "
+                    f"seg_w={seg_width:.3f} orient={orientation:.4f} "
+                    f"type={type_onehot}"
+                )
+
+    except Exception as _me:
+        road_debug_lines.append(f"  OUTER ERROR: {type(_me).__name__}({_me})")
+
+    road_state_probe = (
+        np.array(road_rows[:2], dtype=np.float32)
+        if road_rows else
+        np.zeros((0, 13), dtype=np.float32)
+    )
+
+    # ── Log results ───────────────────────────────────────────────────────────
+    sep = "=" * 64
+    log.info(f"\n{sep}")
+    log.info(f"WHITEBOX FEATURE PROBE  token={token}")
+    log.info(f"{sep}")
+    log.info(
+        f"[ego_state 1x6]  speed={ego_state[0,0]:.4f}  "
+        f"vehicle_length={ego_state[0,1]:.4f}  vehicle_width={ego_state[0,2]:.4f}  "
+        f"rel_goal_x={ego_state[0,3]:.4f}  rel_goal_y={ego_state[0,4]:.4f}  "
+        f"is_collided={int(ego_state[0,5])}"
+    )
+    log.info(
+        f"  -> ego_velocity raw shape={np.array(ego_status.ego_velocity).shape}  "
+        f"values={np.array(ego_status.ego_velocity).tolist()}"
+    )
+    log.info(
+        f"  -> ego_pose raw shape={np.array(ego_status.ego_pose).shape}  "
+        f"[x={ego_x:.3f}, y={ego_y:.3f}, heading={ego_heading:.4f}]  type={type(ego_status.ego_pose).__name__}"
+    )
+    log.info(
+        f"  -> num_future_frames={scene.scene_metadata.num_future_frames}  "
+        f"trajectory.poses shape={trajectory.poses.shape}"
+    )
+    log.info(f"\n[partner_state 2x6 probe]  total agents in frame: {N}")
+    log.info(f"  cols: [speed, rel_pos_x, rel_pos_y, orientation(heading), vehicle_length, vehicle_width]")
+    log.info(f"  -> annotations.boxes.shape={annotations.boxes.shape}  "
+             f"velocity_3d.shape={annotations.velocity_3d.shape}")
+    for i, row in enumerate(partner_state_probe):
+        log.info(f"  agent[{i}]: speed={row[0]:.4f}  x={row[1]:.4f}  y={row[2]:.4f}  "
+                 f"heading={row[3]:.4f}  length={row[4]:.4f}  width={row[5]:.4f}")
+    log.info(
+        f"\n[road_state 2x13 probe]  "
+        f"(radius=50m, layers: LANE/LANE_CONNECTOR/ROADBLOCK/CROSSWALK/SPEED_BUMP/STOP_LINE)"
+    )
+    log.info(f"  cols: [x, y, seg_len, seg_width, seg_height, orientation, "
+             f"none, RoadLine, RoadEdge, RoadLane, CrossWalk, SpeedBump, StopSign]")
+    for dbg in road_debug_lines:
+        log.info(dbg)
+    for i, row in enumerate(road_state_probe):
+        log.info(f"  road[{i}]: x={row[0]:.4f}  y={row[1]:.4f}  "
+                 f"seg_len={row[2]:.4f}  seg_w={row[3]:.4f}  seg_h={row[4]:.4f}  "
+                 f"orient={row[5]:.4f}  type={[int(v) for v in row[6:]]}")
+    log.info(sep + "\n")
+    return True
+
 
 CONFIG_PATH = "config/pdm_scoring"
 CONFIG_NAME = "default_run_pdm_score"
@@ -81,6 +311,7 @@ def run_pdm_score(args: List[Dict[str, Union[List[str], DictConfig]]]) -> List[p
     scene_loader_tokens_stage_one = scene_loader.tokens_stage_one
 
     tokens_to_evaluate_stage_one = list(set(scene_loader_tokens_stage_one) & set(metric_cache_loader.tokens))
+    _whitebox_probe_done = False  # fire the feature probe exactly once per worker
     for idx, (token) in enumerate(tokens_to_evaluate_stage_one):
         logger.info(
             f"Processing stage one reactive scenario {idx + 1} / {len(tokens_to_evaluate_stage_one)} in thread_id={thread_id}, node_id={node_id}"
@@ -88,8 +319,14 @@ def run_pdm_score(args: List[Dict[str, Union[List[str], DictConfig]]]) -> List[p
         try:
             metric_cache = metric_cache_loader.get_from_token(token)
             agent_input = scene_loader.get_agent_input_from_token(token)
+            scene = scene_loader.get_scene_from_token(token)  # moved here for whitebox probe
+            if not _whitebox_probe_done:
+                try:
+                    _whitebox_probe_done = _extract_whitebox_features(scene, token, logger)
+                except Exception as _probe_err:
+                    logger.warning(f"Whitebox probe failed for token {token}: {_probe_err}")
+                    _whitebox_probe_done = True  # don't retry on every token
             if agent.requires_scene:
-                scene = scene_loader.get_scene_from_token(token)
                 trajectory = agent.compute_trajectory(agent_input, scene)
             else:
                 trajectory = agent.compute_trajectory(agent_input)
@@ -142,8 +379,8 @@ def run_pdm_score(args: List[Dict[str, Union[List[str], DictConfig]]]) -> List[p
         try:
             metric_cache = metric_cache_loader.get_from_token(token)
             agent_input = scene_loader.get_agent_input_from_token(token)
+            scene = scene_loader.get_scene_from_token(token)  # symmetric with stage one
             if agent.requires_scene:
-                scene = scene_loader.get_scene_from_token(token)
                 trajectory = agent.compute_trajectory(agent_input, scene)
             else:
                 trajectory = agent.compute_trajectory(agent_input)
