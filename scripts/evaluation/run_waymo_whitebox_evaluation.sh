@@ -10,3 +10,4 @@ experiment_name=waymo_whitebox_agent \
 metric_cache_path=$CACHE_PATH \
 synthetic_sensor_path=$SYNTHETIC_SENSOR_PATH \
 synthetic_scenes_path=$SYNTHETIC_SCENES_PATH \
+worker=sequential

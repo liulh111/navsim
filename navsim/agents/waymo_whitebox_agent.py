@@ -11,7 +11,11 @@ Input features (flattened):
 Output: 8 poses x 3 (x, y, heading) in ego-local coordinates.
 """
 
-from typing import Optional
+import json
+import os
+from datetime import datetime
+from pathlib import Path
+from typing import Dict, Optional
 
 import numpy as np
 import torch
@@ -31,10 +35,130 @@ ROAD_DIM = 13
 EGO_DIM = 6
 TOTAL_INPUT_DIM = EGO_DIM + PARTNER_NUM * PARTNER_DIM + ROAD_OBS_COUNT * ROAD_DIM  # 2984
 
+# Target pkl file for saving whitebox features
+TARGET_SCENE_TOKEN = "00a0f25bb297f4bb2"
+_whitebox_saved = False  # Global flag to ensure save only once
+
 
 def _wrap_to_pi(angle: np.ndarray) -> np.ndarray:
     """Wrap angle(s) to [-pi, pi]."""
     return (angle + np.pi) % (2 * np.pi) - np.pi
+
+
+def _save_whitebox_features_structured(
+    ego_state: np.ndarray,
+    partner_state: np.ndarray,
+    road_state: np.ndarray,
+    scene: Scene,
+    save_dir: str = "/data/llh/navsim_workspace/exp/whitebox_features",
+) -> None:
+    """
+    Save whitebox features as structured JSON for analysis.
+
+    Args:
+        ego_state: (6,) array [speed, vehicle_length, vehicle_width, rel_goal_x, rel_goal_y, is_collided]
+        partner_state: (63, 6) array [speed, rel_pos_x, rel_pos_y, orientation, vehicle_length, vehicle_width]
+        road_state: (200, 13) array [x, y, seg_len, seg_width, seg_height, orientation, type_onehot(7)]
+        scene: NAVSIM Scene object
+        save_dir: Directory to save the output JSON
+    """
+    global _whitebox_saved
+    if _whitebox_saved:
+        return
+
+    # Check if this is the target scene
+    scene_token = scene.scene_metadata.scene_token
+    if not scene_token.startswith(TARGET_SCENE_TOKEN):
+        return
+
+    _whitebox_saved = True  # Mark as saved
+
+    # Create save directory
+    os.makedirs(save_dir, exist_ok=True)
+
+    # Build structured dictionary
+    frame_idx = scene.scene_metadata.num_history_frames - 1
+    ego_status = scene.frames[frame_idx].ego_status
+    annotations = scene.frames[frame_idx].annotations
+
+    # Ego pose info
+    ego_pose_arr = ego_status.ego_pose
+    ego_x = float(ego_pose_arr[0])
+    ego_y = float(ego_pose_arr[1])
+    ego_heading = float(ego_pose_arr[2])
+
+    # Count non-zero partners
+    partner_count = 0
+    for i in range(PARTNER_NUM):
+        if np.any(partner_state[i] != 0):
+            partner_count += 1
+
+    # Count non-zero road segments
+    road_count = 0
+    for i in range(ROAD_OBS_COUNT):
+        if np.any(road_state[i] != 0):
+            road_count += 1
+
+    structured_data: Dict = {
+        "metadata": {
+            "scene_token": scene_token,
+            "initial_token": scene.scene_metadata.initial_token,
+            "log_name": scene.scene_metadata.log_name,
+            "map_name": scene.scene_metadata.map_name,
+            "num_history_frames": scene.scene_metadata.num_history_frames,
+            "num_future_frames": scene.scene_metadata.num_future_frames,
+            "frame_idx": frame_idx,
+            "timestamp": datetime.now().isoformat(),
+        },
+        "ego_global": {
+            "x": ego_x,
+            "y": ego_y,
+            "heading": ego_heading,
+            "velocity": ego_status.ego_velocity.tolist(),
+        },
+        "ego_state": {
+            "description": "[speed, vehicle_length, vehicle_width, rel_goal_x, rel_goal_y, is_collided]",
+            "shape": list(ego_state.shape),
+            "data": ego_state.tolist(),
+            "field_names": ["speed", "vehicle_length", "vehicle_width", "rel_goal_x", "rel_goal_y", "is_collided"],
+        },
+        "partner_state": {
+            "description": "[speed, rel_pos_x, rel_pos_y, orientation, vehicle_length, vehicle_width] per agent",
+            "shape": list(partner_state.shape),
+            "num_valid_partners": partner_count,
+            "total_agents_in_frame": annotations.boxes.shape[0] if annotations is not None else 0,
+            "data": partner_state.tolist(),
+            "field_names": ["speed", "rel_pos_x", "rel_pos_y", "orientation", "vehicle_length", "vehicle_width"],
+        },
+        "road_state": {
+            "description": "[x, y, seg_len, seg_width, seg_height, orientation, type_onehot(7)] per segment",
+            "shape": list(road_state.shape),
+            "num_valid_segments": road_count,
+            "data": road_state.tolist(),
+            "field_names": ["x", "y", "seg_len", "seg_width", "seg_height", "orientation",
+                           "type_none", "type_RoadLine", "type_RoadEdge", "type_RoadLane",
+                           "type_CrossWalk", "type_SpeedBump", "type_StopSign"],
+        },
+        "flattened_features": {
+            "description": "Concatenated flat vector (ego + partner + road)",
+            "total_dim": TOTAL_INPUT_DIM,
+            "ego_dim": EGO_DIM,
+            "partner_dim": PARTNER_NUM * PARTNER_DIM,
+            "road_dim": ROAD_OBS_COUNT * ROAD_DIM,
+        },
+    }
+
+    # Save to JSON
+    save_path = os.path.join(save_dir, f"whitebox_features_{scene_token}.json")
+    with open(save_path, "w", encoding="utf-8") as f:
+        json.dump(structured_data, f, indent=2, ensure_ascii=False)
+
+    print(f"\n{'='*80}")
+    print(f"WHITEBOX FEATURES SAVED to: {save_path}")
+    print(f"  - ego_state: {ego_state.shape}")
+    print(f"  - partner_state: {partner_state.shape} ({partner_count} valid partners)")
+    print(f"  - road_state: {road_state.shape} ({road_count} valid segments)")
+    print(f"{'='*80}\n")
 
 
 def extract_waymo_whitebox_features(scene: Scene) -> np.ndarray:
@@ -87,6 +211,9 @@ def extract_waymo_whitebox_features(scene: Scene) -> np.ndarray:
 
     # ── 3. road_state (200 x 13) ──────────────────────────────────────────
     road_state = _extract_road_state(scene, ego_x, ego_y, ego_heading)
+
+    # ── Save structured whitebox features for target scene (first stage only) ──
+    _save_whitebox_features_structured(ego_state, partner_state, road_state, scene)
 
     # ── Flatten and concatenate ────────────────────────────────────────────
     features = np.concatenate([
