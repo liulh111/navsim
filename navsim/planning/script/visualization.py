@@ -61,8 +61,13 @@ def draw_vehicle(ax, cx, cy, length, width, yaw, color="cyan", alpha=0.8, lw=1.0
     head_y = cy + (length / 2) * np.sin(yaw)
     ax.plot([cx, head_x], [cy, head_y], color=color, linewidth=lw+0.5, alpha=alpha)
 
-def visualize_single_obs_and_save(obs_2984, save_path, dpi=160):
-    ego, partners, roads = parse_observation(obs_2984)
+def visualize_single_obs_and_save(ego, partners, roads, save_path, dpi=160):
+    """
+    Visualize extracted features.
+    :param ego: (6,) array
+    :param partners: (M, 6) array
+    :param roads: (N, 13) array — variable length
+    """
     _, ego_len, ego_wid, rel_goal_x, rel_goal_y, is_collided = ego
     fig, ax = plt.subplots(figsize=(9, 9))
     ax.set_facecolor("#1e1e1e")
@@ -101,6 +106,8 @@ def visualize_single_obs_and_save(obs_2984, save_path, dpi=160):
     ax.set_xlabel("x (ego frame)")
     ax.set_ylabel("y (ego frame)")
     ax.axis("equal")
+    ax.set_xlim(-80, 80)
+    ax.set_ylim(-80, 80)
     ax.grid(True, alpha=0.2)
     os.makedirs(os.path.dirname(save_path), exist_ok=True)
     plt.tight_layout()
