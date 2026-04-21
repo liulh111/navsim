@@ -12,7 +12,9 @@ from hydra.utils import instantiate
 from dataclasses import replace
 from pathlib import Path
 from omegaconf import DictConfig
+from nuplan.common.actor_state.vehicle_parameters import get_pacifica_parameters
 from navsim.common.dataclasses import Scene, SensorConfig
+from navsim.common.enums import BoundingBoxIndex
 from navsim.common.dataloader import MetricCacheLoader, SceneLoader
 
 import matplotlib
@@ -27,14 +29,21 @@ from navsim.visualization.plots import (
 )
 from navsim.visualization.bev import add_annotations_to_bev_ax
 
-from navsim.planning.script.extract_waymo_feature_stage_one import extract_waymo_whitebox_features  # noqa: F401
-from navsim.planning.script.visualization import visualize_single_obs_and_save  # noqa: F401
+from navsim.planning.script.extract_waymo_feature_stage_one import (
+    _extract_road_state,
+    _wrap_to_pi,
+)
+from navsim.planning.script.visualization import visualize_single_obs_and_save
 
 
 logger = logging.getLogger(__name__)
 
 CONFIG_PATH = "config/pdm_scoring"
 CONFIG_NAME = "default_run_pdm_score"
+
+
+PARTNER_NUM = 63
+PARTNER_DIM = 6
 
 
 def _build_synthetic_sensor_config() -> SensorConfig:
@@ -51,8 +60,82 @@ def _coerce_annotation_names_to_array(scene: Scene) -> None:
         anns = getattr(frame, "annotations", None)
         if anns is None:
             continue
-        if not isinstance(anns.names, np.ndarray):
+        if hasattr(anns, "names") and not isinstance(anns.names, np.ndarray):
             anns.names = np.array(anns.names, dtype=object)
+
+
+def _extract_partner_state(annotations) -> np.ndarray:
+    N = annotations.boxes.shape[0]
+    if N == 0:
+        return np.zeros((PARTNER_NUM, PARTNER_DIM), dtype=np.float32)
+
+    speeds = np.linalg.norm(annotations.velocity_3d[:, :2], axis=1)
+    rel_pos_x = annotations.boxes[:, BoundingBoxIndex.X]
+    rel_pos_y = annotations.boxes[:, BoundingBoxIndex.Y]
+    orientation = _wrap_to_pi(annotations.boxes[:, BoundingBoxIndex.HEADING])
+    vehicle_length = annotations.boxes[:, BoundingBoxIndex.LENGTH]
+    vehicle_width = annotations.boxes[:, BoundingBoxIndex.WIDTH]
+
+    all_partners = np.stack(
+        [speeds, rel_pos_x, rel_pos_y, orientation, vehicle_length, vehicle_width],
+        axis=1,
+    ).astype(np.float32)
+
+    distances = np.sqrt(rel_pos_x ** 2 + rel_pos_y ** 2)
+    sorted_indices = np.argsort(distances)
+    all_partners = all_partners[sorted_indices]
+
+    result = np.zeros((PARTNER_NUM, PARTNER_DIM), dtype=np.float32)
+    count = min(N, PARTNER_NUM)
+    result[:count] = all_partners[:count]
+    return result
+
+
+def extract_waymo_whitebox_features_stage_two(scene: Scene):
+    """Extract stage-two whitebox features with robust fallbacks for missing fields.
+
+    Returns (ego_state, partner_state, road_state):
+      ego_state:     (6,)
+      partner_state: (63, 6)
+      road_state:    (N, 13)
+    """
+    frame_idx = scene.scene_metadata.num_history_frames - 1
+    ego_status = scene.frames[frame_idx].ego_status
+    annotations = scene.frames[frame_idx].annotations
+
+    speed = float(np.linalg.norm(ego_status.ego_velocity))
+    vehicle_params = get_pacifica_parameters()
+    vehicle_length = vehicle_params.length
+    vehicle_width = vehicle_params.width
+
+    # Stage-two synthetic scenes can miss valid future trajectory poses.
+    rel_goal_x = 0.0
+    rel_goal_y = 0.0
+    try:
+        trajectory = scene.get_future_trajectory(
+            num_trajectory_frames=scene.scene_metadata.num_future_frames
+        )
+        if hasattr(trajectory, "poses") and len(trajectory.poses) > 0:
+            rel_goal_x = float(trajectory.poses[-1, 0])
+            rel_goal_y = float(trajectory.poses[-1, 1])
+    except Exception as exc:
+        logger.warning("[Stage2] Future trajectory unavailable for goal, fallback to (0,0): %s", exc)
+
+    is_collided = 0.0
+    ego_state = np.array(
+        [speed, vehicle_length, vehicle_width, rel_goal_x, rel_goal_y, is_collided],
+        dtype=np.float32,
+    )
+
+    partner_state = _extract_partner_state(annotations)
+
+    try:
+        road_state = _extract_road_state(scene, frame_idx)
+    except Exception as exc:
+        logger.warning("[Stage2] Road extraction failed, fallback to empty road_state: %s", exc)
+        road_state = np.zeros((0, 13), dtype=np.float32)
+
+    return ego_state, partner_state, road_state
 
 
 def navsim_stage_two_visualization(scene: Scene, token: str) -> None:
@@ -127,12 +210,13 @@ def main(cfg: DictConfig) -> None:
 
     navsim_stage_two_visualization(scene, token)
 
-    # VIZ_DIR = Path(os.path.join("viz_output_stage_two", token))
-    # save_path = VIZ_DIR / f"waymo_whitebox_obs.png"
-    # ego_state, partner_state, road_state = extract_waymo_whitebox_features(scene)
-    # visualize_single_obs_and_save(
-    #     ego=ego_state, partners=partner_state, roads=road_state, save_path=str(save_path)
-    # )
+    VIZ_DIR = Path(os.path.join("viz_output", "stage_two", token))
+    save_path = VIZ_DIR / "waymo_whitebox_obs.png"
+    ego_state, partner_state, road_state = extract_waymo_whitebox_features_stage_two(scene)
+    visualize_single_obs_and_save(
+        ego=ego_state, partners=partner_state, roads=road_state, save_path=str(save_path)
+    )
+    logger.info("Saved stage-two waymo whitebox visualization -> %s", save_path)
 
 
 if __name__ == "__main__":
