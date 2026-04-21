@@ -466,13 +466,13 @@ def main(cfg: DictConfig) -> None:
     
     navsim_self_visualization(scene, token)
 
-    VIZ_DIR = Path(os.path.join("viz_output", token))
-    save_path = VIZ_DIR / f"waymo_whitebox_obs.png"
+    # VIZ_DIR = Path(os.path.join("viz_output", token))
+    # save_path = VIZ_DIR / f"waymo_whitebox_obs.png"
 
-    ego_state, partner_state, road_state = extract_waymo_whitebox_features(scene)
-    visualize_single_obs_and_save(
-        ego=ego_state, partners=partner_state, roads=road_state, save_path=str(save_path)
-    )
+    # ego_state, partner_state, road_state = extract_waymo_whitebox_features(scene)
+    # visualize_single_obs_and_save(
+    #     ego=ego_state, partners=partner_state, roads=road_state, save_path=str(save_path)
+    # )
 
 if __name__ == "__main__":
     main()

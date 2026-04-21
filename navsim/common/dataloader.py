@@ -134,19 +134,19 @@ class SceneLoader:
         self._scene_filter = scene_filter
         self._sensor_config = sensor_config
 
-        # if scene_filter.include_synthetic_scenes:
-        #     assert (
-        #         synthetic_scenes_path is not None
-        #     ), "Synthetic scenes path cannot be None, when synthetic scenes_filter.include_synthetic_scenes is set to True."
-        #     self.synthetic_scenes = filter_synthetic_scenes(
-        #         data_path=synthetic_scenes_path,
-        #         scene_filter=scene_filter,
-        #         stage1_scenes_final_frames_tokens=stage1_scenes_final_frames_tokens,
-        #     )
-        #     self.synthetic_scenes_tokens = set(self.synthetic_scenes.keys())
-        # else:
-        self.synthetic_scenes = {}
-        self.synthetic_scenes_tokens = set()
+        if scene_filter.include_synthetic_scenes:
+            assert (
+                synthetic_scenes_path is not None
+            ), "Synthetic scenes path cannot be None, when synthetic scenes_filter.include_synthetic_scenes is set to True."
+            self.synthetic_scenes = filter_synthetic_scenes(
+                data_path=synthetic_scenes_path,
+                scene_filter=scene_filter,
+                stage1_scenes_final_frames_tokens=stage1_scenes_final_frames_tokens,
+            )
+            self.synthetic_scenes_tokens = set(self.synthetic_scenes.keys())
+        else:
+            self.synthetic_scenes = {}
+            self.synthetic_scenes_tokens = set()
 
     @property
     def tokens(self) -> List[str]:
