@@ -33,7 +33,7 @@ from navsim.visualization.plots import (
 from navsim.visualization.bev import add_annotations_to_bev_ax, add_lidar_to_bev_ax
 
 
-from navsim.planning.script.visualization import parse_observation, visualize_single_obs_and_save
+from navsim.planning.script.visualization import visualize_single_obs_and_save
 
 
 logger = logging.getLogger(__name__)
@@ -52,7 +52,7 @@ TOTAL_DIM = EGO_DIM + PARTNER_NUM * PARTNER_DIM + ROAD_NUM * ROAD_DIM  # 2984
 
 
 SEARCH_RADIUS = 200.0  # meters for map query
-MAX_POINTS_PER_TYPE = 10000  # max road points per type (closest by distance)
+MAX_POINTS_PER_TYPE = 5000  # max road points per type (closest by distance)
 
 # Waymo road type indices: 0=none, 1=RoadLine, 2=RoadEdge, 3=RoadLane, 4=CrossWalk, 5=SpeedBump, 6=StopSign
 ROAD_TYPE_NAMES = ["none", "RoadLine", "RoadEdge", "RoadLane", "CrossWalk", "SpeedBump", "StopSign"]
@@ -376,10 +376,9 @@ def _extract_partner_state(annotations) -> np.ndarray:
 
 def navsim_self_visualization(scene: Scene, token: str) -> None:
 
-    VIZ_DIR = Path(os.path.join("viz_output", token))
+    VIZ_DIR = Path(os.path.join("viz_output", "stage_one", token))
     VIZ_DIR.mkdir(parents=True, exist_ok=True)
 
-    # 取 scene 中历史帧的最后一帧（即当前时刻）的索引
     current_frame_idx = scene.scene_metadata.num_history_frames - 1
 
     # --- 1. 仅标注框的自定义 BEV ---
@@ -439,40 +438,35 @@ def navsim_self_visualization(scene: Scene, token: str) -> None:
 @hydra.main(config_path=CONFIG_PATH, config_name=CONFIG_NAME, version_base=None)
 def main(cfg: DictConfig) -> None:
     """
-    Main entrypoint for running PDMS evaluation.
+    Main entrypoint for stage-one (synthetic) whitebox visualization.
     :param cfg: omegaconf dictionary
     """
 
     scene_loader = SceneLoader(
-        synthetic_sensor_path=None,
-        # original_sensor_path=None,
+        synthetic_sensor_path=Path(cfg.synthetic_sensor_path),
         original_sensor_path=Path(cfg.original_sensor_path),
         data_path=Path(cfg.navsim_log_path),
         synthetic_scenes_path=Path(cfg.synthetic_scenes_path),
         scene_filter=instantiate(cfg.train_test_split.scene_filter),
-        # sensor_config=SensorConfig.build_no_sensors(),
         sensor_config=SensorConfig.build_all_sensors(),
     )
     metric_cache_loader = MetricCacheLoader(Path(cfg.metric_cache_path))
 
     scene_loader_tokens_stage_one = scene_loader.tokens_stage_one
     tokens_to_evaluate_stage_one = sorted(set(scene_loader_tokens_stage_one) & set(metric_cache_loader.tokens))
-    if not tokens_to_evaluate_stage_one:
-        logger.warning("No stage-one tokens overlap between SceneLoader and MetricCacheLoader.")
-        return
 
     token = tokens_to_evaluate_stage_one[0]
     scene = scene_loader.get_scene_from_token(token)
     
     navsim_self_visualization(scene, token)
 
-    # VIZ_DIR = Path(os.path.join("viz_output", token))
-    # save_path = VIZ_DIR / f"waymo_whitebox_obs.png"
+    VIZ_DIR = Path(os.path.join("viz_output", "stage_one", token))
+    save_path = VIZ_DIR / f"waymo_whitebox_obs.png"
 
-    # ego_state, partner_state, road_state = extract_waymo_whitebox_features(scene)
-    # visualize_single_obs_and_save(
-    #     ego=ego_state, partners=partner_state, roads=road_state, save_path=str(save_path)
-    # )
+    ego_state, partner_state, road_state = extract_waymo_whitebox_features(scene)
+    visualize_single_obs_and_save(
+        ego=ego_state, partners=partner_state, roads=road_state, save_path=str(save_path)
+    )
 
 if __name__ == "__main__":
     main()

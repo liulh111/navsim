@@ -3,7 +3,7 @@ CACHE_PATH=$NAVSIM_EXP_ROOT/metric_cache
 SYNTHETIC_SENSOR_PATH=$OPENSCENE_DATA_ROOT/navhard_two_stage/sensor_blobs
 SYNTHETIC_SCENES_PATH=$OPENSCENE_DATA_ROOT/navhard_two_stage/synthetic_scene_pickles
 
-python $NAVSIM_DEVKIT_ROOT/navsim/planning/script/extract_waymo_feature.py \
+python $NAVSIM_DEVKIT_ROOT/navsim/planning/script/extract_waymo_feature_stage_one.py \
 train_test_split=$TRAIN_TEST_SPLIT \
 experiment_name=extract_waymo_feature \
 metric_cache_path=$CACHE_PATH \

@@ -1,5 +1,4 @@
 import os
-import torch
 import numpy as np
 import matplotlib.pyplot as plt
 from matplotlib.patches import Rectangle
@@ -30,25 +29,6 @@ ROAD_TYPE_COLORS = {
     "SpeedBump": "#ff00ff",
     "StopSign": "#ff3333",
 }
-
-def parse_observation(obs_2984):
-    if isinstance(obs_2984, torch.Tensor):
-        obs_2984 = obs_2984.detach().cpu().numpy()
-
-    if obs_2984.shape[0] != TOTAL_DIM:
-        raise ValueError(f"Expected observation dim {TOTAL_DIM}, got {obs_2984.shape[0]}")
-        
-    ego = obs_2984[:EGO_DIM]
-    
-    p_start = EGO_DIM
-    p_end = p_start + PARTNER_NUM * PARTNER_DIM
-    partners = obs_2984[p_start:p_end].reshape(PARTNER_NUM, PARTNER_DIM)
-    
-    r_start = p_end
-    r_end = r_start + ROAD_NUM * ROAD_DIM
-    roads = obs_2984[r_start:r_end].reshape(ROAD_NUM, ROAD_DIM)
-    
-    return ego, partners, roads
 
 def draw_vehicle(ax, cx, cy, length, width, yaw, color="cyan", alpha=0.8, lw=1.0):
     rect = Rectangle((-length/2, -width/2), length, width,

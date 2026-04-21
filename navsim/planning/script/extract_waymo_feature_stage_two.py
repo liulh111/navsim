@@ -27,7 +27,7 @@ from navsim.visualization.plots import (
 )
 from navsim.visualization.bev import add_annotations_to_bev_ax
 
-from navsim.planning.script.extract_waymo_feature import extract_waymo_whitebox_features  # noqa: F401
+from navsim.planning.script.extract_waymo_feature_stage_one import extract_waymo_whitebox_features  # noqa: F401
 from navsim.planning.script.visualization import visualize_single_obs_and_save  # noqa: F401
 
 
@@ -56,11 +56,9 @@ def _coerce_annotation_names_to_array(scene: Scene) -> None:
 
 
 def navsim_stage_two_visualization(scene: Scene, token: str) -> None:
-    """Visualize a stage-two (synthetic) scene. Skips lidar-dependent plots."""
-
     _coerce_annotation_names_to_array(scene)
 
-    VIZ_DIR = Path(os.path.join("viz_output_stage_two", token))
+    VIZ_DIR = Path(os.path.join("viz_output", "stage_two", token))
     VIZ_DIR.mkdir(parents=True, exist_ok=True)
 
     current_frame_idx = scene.scene_metadata.num_history_frames - 1
@@ -122,15 +120,7 @@ def main(cfg: DictConfig) -> None:
     metric_cache_loader = MetricCacheLoader(Path(cfg.metric_cache_path))
 
     scene_loader_tokens_stage_two = scene_loader.reactive_tokens_stage_two
-    if scene_loader_tokens_stage_two is None:
-        logger.warning("reactive_tokens_stage_two is None — check scene_filter config.")
-        return
-    tokens_to_evaluate_stage_two = sorted(
-        set(scene_loader_tokens_stage_two) & set(metric_cache_loader.tokens)
-    )
-    if not tokens_to_evaluate_stage_two:
-        logger.warning("No stage-two tokens overlap between SceneLoader and MetricCacheLoader.")
-        return
+    tokens_to_evaluate_stage_two = sorted(set(scene_loader_tokens_stage_two) & set(metric_cache_loader.tokens))
 
     token = tokens_to_evaluate_stage_two[0]
     scene = scene_loader.get_scene_from_token(token)
