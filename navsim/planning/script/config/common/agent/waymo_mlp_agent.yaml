@@ -1,0 +1,13 @@
+_target_: navsim.agents.waymo_mlp_agent.WaymoMLPAgent
+_convert_: 'all'
+
+trajectory_sampling:
+  _target_: nuplan.planning.simulation.trajectory.trajectory_sampling.TrajectorySampling
+  _convert_: 'all'
+  time_horizon: 4
+  interval_length: 0.5
+
+hidden_layer_dim: 256
+feature_root: /data/llh/navsim_workspace/exp/pipeline_output
+feature_filename: waymo_obs_gpudrive.npy
+seed: 0

@@ -1,7 +1,7 @@
-import debugpy
-debugpy.listen(("localhost", 9501))
-print("Waiting for debugger attach")
-debugpy.wait_for_client()
+# import debugpy
+# debugpy.listen(("localhost", 9501))
+# print("Waiting for debugger attach")
+# debugpy.wait_for_client()
 
 
 import logging
@@ -96,7 +96,7 @@ def run_pdm_score(args: List[Dict[str, Union[List[str], DictConfig]]]) -> List[p
             agent_input = scene_loader.get_agent_input_from_token(token)
             scene = scene_loader.get_scene_from_token(token)  # moved here for whitebox probe
             if agent.requires_scene:
-                trajectory = agent.compute_trajectory(agent_input, scene)
+                trajectory = agent.compute_trajectory(agent_input, scene, token)
             else:
                 trajectory = agent.compute_trajectory(agent_input)
 
@@ -150,7 +150,7 @@ def run_pdm_score(args: List[Dict[str, Union[List[str], DictConfig]]]) -> List[p
             agent_input = scene_loader.get_agent_input_from_token(token)
             scene = scene_loader.get_scene_from_token(token)  # symmetric with stage one
             if agent.requires_scene:
-                trajectory = agent.compute_trajectory(agent_input, scene)
+                trajectory = agent.compute_trajectory(agent_input, scene, token)
             else:
                 trajectory = agent.compute_trajectory(agent_input)
 

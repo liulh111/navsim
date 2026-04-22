@@ -1,8 +1,20 @@
 """
-Step 1: Export scene metadata from navsim (run in navsim-llh env).
+Step 1: Export rich scene metadata from navsim (run in navsim-llh env).
 
-Loads one scene from navhard_two_stage stage1, exports
-{token, map_name, ego_pose} to a pickle file.
+Selects one token from stage-1 and one from stage-2 of navhard_two_stage
+(intersected with the metric cache), and exports a pickle per token that
+carries everything downstream stages need to produce the Waymo 2984-dim
+observation via ScenarioMax + GPUDrive:
+
+    - token, stage, map_name
+    - ego_pose (global [x, y, heading])
+    - ego_velocity_local [vx, vy]
+    - ego_size [length, width, height]
+    - goal_local [gx, gy]         (stage-1: future traj endpoint; stage-2: (0,0))
+    - partners_local: list of {rel_x, rel_y, heading, vel_x, vel_y,
+                               length, width, height, name}
+                      — in annotation order (no distance sort, to match the
+                        standard ScenarioMax → nuPlan → GPUDrive convention)
 
 Usage:
     conda activate navsim-llh
@@ -11,29 +23,124 @@ Usage:
 """
 import logging
 import pickle
+from pathlib import Path
 
 import hydra
+import numpy as np
 from hydra.utils import instantiate
-from pathlib import Path
 from omegaconf import DictConfig
 
-from navsim.common.dataclasses import SensorConfig
+from nuplan.common.actor_state.vehicle_parameters import get_pacifica_parameters
+
+from navsim.common.dataclasses import Scene, SensorConfig
 from navsim.common.dataloader import MetricCacheLoader, SceneLoader
+from navsim.common.enums import BoundingBoxIndex
 
 logger = logging.getLogger(__name__)
 
 CONFIG_PATH = "config/pdm_scoring"
 CONFIG_NAME = "default_run_pdm_score"
 
-# All outputs go under this absolute path to avoid hydra cwd issues
 OUTPUT_BASE = Path("/data/llh/navsim_workspace/exp/pipeline_output")
+
+EGO_HEIGHT = 1.5  # matches the dummy ego height used in existing step2
+
+
+def _wrap_to_pi(angle: float) -> float:
+    return float((angle + np.pi) % (2 * np.pi) - np.pi)
+
+
+def _export_one_token(scene: Scene, token: str, stage: str) -> Path:
+    """Serialise the rich metadata for a single scene to a pickle."""
+    frame_idx = scene.scene_metadata.num_history_frames - 1
+    frame = scene.frames[frame_idx]
+
+    ego_pose = frame.ego_status.ego_pose  # [x, y, heading], global
+    ego_velocity_local = frame.ego_status.ego_velocity  # [vx, vy], ego-local
+
+    pacifica = get_pacifica_parameters()
+    ego_size = [float(pacifica.length), float(pacifica.width), float(EGO_HEIGHT)]
+
+    # Goal: stage-1 uses future trajectory endpoint; stage-2 falls back to (0, 0)
+    goal_local = [0.0, 0.0]
+    if stage == "stage_one":
+        trajectory = scene.get_future_trajectory(
+            num_trajectory_frames=scene.scene_metadata.num_future_frames
+        )
+        goal_local = [float(trajectory.poses[-1, 0]), float(trajectory.poses[-1, 1])]
+    else:
+        try:
+            trajectory = scene.get_future_trajectory(
+                num_trajectory_frames=scene.scene_metadata.num_future_frames
+            )
+            if hasattr(trajectory, "poses") and len(trajectory.poses) > 0:
+                goal_local = [
+                    float(trajectory.poses[-1, 0]),
+                    float(trajectory.poses[-1, 1]),
+                ]
+        except Exception as exc:
+            logger.warning(
+                "[%s] future trajectory unavailable for %s, goal=(0,0): %s",
+                stage, token, exc,
+            )
+
+    # Partners in annotation order (no distance sort)
+    annotations = frame.annotations
+    partners_local = []
+    if annotations is not None and annotations.boxes.shape[0] > 0:
+        boxes = annotations.boxes
+        vel3d = annotations.velocity_3d
+        names = list(annotations.names) if hasattr(annotations, "names") else []
+        for i in range(boxes.shape[0]):
+            partners_local.append(
+                {
+                    "rel_x": float(boxes[i, BoundingBoxIndex.X]),
+                    "rel_y": float(boxes[i, BoundingBoxIndex.Y]),
+                    "heading": _wrap_to_pi(float(boxes[i, BoundingBoxIndex.HEADING])),
+                    "vel_x": float(vel3d[i, 0]),
+                    "vel_y": float(vel3d[i, 1]),
+                    "length": float(boxes[i, BoundingBoxIndex.LENGTH]),
+                    "width": float(boxes[i, BoundingBoxIndex.WIDTH]),
+                    "height": float(boxes[i, BoundingBoxIndex.HEIGHT]),
+                    "name": str(names[i]) if i < len(names) else "",
+                }
+            )
+
+    metadata = {
+        "token": token,
+        "stage": stage,
+        "map_name": scene.scene_metadata.map_name,
+        "ego_pose": [float(ego_pose[0]), float(ego_pose[1]), float(ego_pose[2])],
+        "ego_velocity_local": [float(ego_velocity_local[0]), float(ego_velocity_local[1])],
+        "ego_size": ego_size,
+        "goal_local": goal_local,
+        "partners_local": partners_local,
+    }
+
+    output_dir = OUTPUT_BASE / token
+    output_dir.mkdir(parents=True, exist_ok=True)
+    output_path = output_dir / "scene_metadata.pkl"
+    with open(output_path, "wb") as f:
+        pickle.dump(metadata, f)
+
+    logger.info(
+        "[%s] token=%s map=%s ego_pose=%s partners=%d goal_local=%s -> %s",
+        stage, token, metadata["map_name"], metadata["ego_pose"],
+        len(partners_local), metadata["goal_local"], output_path,
+    )
+    return output_path
 
 
 @hydra.main(config_path=CONFIG_PATH, config_name=CONFIG_NAME, version_base=None)
 def main(cfg: DictConfig) -> None:
+    # `export_all` is an optional Hydra override (default False → only the
+    # first available token per stage is exported, matching the original
+    # smoke-test workflow). Pass `+export_all=true` to iterate every token
+    # intersected with the metric cache in both stages.
+    export_all = bool(cfg.get("export_all", False))
 
     scene_loader = SceneLoader(
-        synthetic_sensor_path=None,
+        synthetic_sensor_path=Path(cfg.synthetic_sensor_path),
         original_sensor_path=Path(cfg.original_sensor_path),
         data_path=Path(cfg.navsim_log_path),
         synthetic_scenes_path=Path(cfg.synthetic_scenes_path),
@@ -41,37 +148,28 @@ def main(cfg: DictConfig) -> None:
         sensor_config=SensorConfig.build_no_sensors(),
     )
     metric_cache_loader = MetricCacheLoader(Path(cfg.metric_cache_path))
+    metric_tokens = set(metric_cache_loader.tokens)
 
-    tokens = sorted(
-        set(scene_loader.tokens_stage_one) & set(metric_cache_loader.tokens)
-    )
-    if not tokens:
-        logger.error("No stage-one tokens found.")
-        return
+    stage_plans = [
+        ("stage_one", sorted(set(scene_loader.tokens_stage_one) & metric_tokens)),
+        ("stage_two", sorted(set(scene_loader.reactive_tokens_stage_two) & metric_tokens)),
+    ]
 
-    token = tokens[0]
-    scene = scene_loader.get_scene_from_token(token)
+    for stage, tokens in stage_plans:
+        if not tokens:
+            logger.error("No %s tokens found in the intersection with metric cache.", stage)
+            continue
 
-    frame_idx = scene.scene_metadata.num_history_frames - 1
-    ego_pose = scene.frames[frame_idx].ego_status.ego_pose  # [x, y, heading]
+        selected = tokens if export_all else tokens[:1]
+        logger.info(
+            "[%s] exporting %d / %d tokens (export_all=%s)",
+            stage, len(selected), len(tokens), export_all,
+        )
 
-    metadata = {
-        "token": token,
-        "map_name": scene.scene_metadata.map_name,
-        "ego_pose": ego_pose.tolist(),  # list for portability
-    }
-
-    output_dir = OUTPUT_BASE / token
-    output_dir.mkdir(parents=True, exist_ok=True)
-    output_path = output_dir / "scene_metadata.pkl"
-
-    with open(output_path, "wb") as f:
-        pickle.dump(metadata, f)
-
-    logger.info(f"Token:    {token}")
-    logger.info(f"Map:      {metadata['map_name']}")
-    logger.info(f"Ego pose: {metadata['ego_pose']}")
-    logger.info(f"Saved to: {output_path}")
+        for i, token in enumerate(selected):
+            logger.info("[%s] (%d/%d) %s", stage, i + 1, len(selected), token)
+            scene = scene_loader.get_scene_from_token(token)
+            _export_one_token(scene, token, stage)
 
 
 if __name__ == "__main__":
