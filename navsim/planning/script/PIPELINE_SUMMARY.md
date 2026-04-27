@@ -91,13 +91,14 @@ bash scripts/evaluation/run_step1_export_metadata.sh all
  "map_name":           "us-ma-boston",
  "ego_pose":           [331068.128, 4690724.234, 1.4974], # 全局 [x, y, heading(rad)]
  "ego_velocity_local": [6.12, 0.03],                      # ego-local [vx, vy]
- "ego_size":           [4.049, 1.852, 1.5],               # Pacifica length/width/height
+ "ego_size":           [5.176, 2.297, 1.5],               # Pacifica length/width/height
  "goal_local":         [gx, gy],                          # stage2 fallback=(0,0)
  "partners_local": [
      {"rel_x": 8.4, "rel_y": -1.3, "heading": -0.02,
       "vel_x": 5.8, "vel_y": 0.0,
       "length": 4.8, "width": 2.1, "height": 1.7,
-      "name": "vehicle"},
+      "name": "vehicle",
+      "instance_token": "...", "track_token": "..."},
      ...                                                  # 按 annotation 顺序, 不排序
  ]}
 ```
@@ -200,7 +201,7 @@ ego_size           = [pacifica.length, pacifica.width, 1.5]
 goal_local = [trajectory.poses[-1, 0], trajectory.poses[-1, 1]]  # stage_one
              if stage == "stage_one" else [0.0, 0.0]
 
-# partners: annotation 顺序, 不按距离排序 (对齐标准 nuPlan→GPUDrive 流)
+# partners: annotation 顺序, 不按距离排序; 同时带上 token 便于后续集合匹配
 for i in range(annotations.boxes.shape[0]):
     partners_local.append({
         "rel_x":   boxes[i, BoundingBoxIndex.X],
@@ -212,6 +213,8 @@ for i in range(annotations.boxes.shape[0]):
         "width":   boxes[i, BoundingBoxIndex.WIDTH],
         "height":  boxes[i, BoundingBoxIndex.HEIGHT],
         "name":    annotations.names[i],
+        "instance_token": annotations.instance_tokens[i],
+        "track_token":    annotations.track_tokens[i],
     })
 ```
 
@@ -221,7 +224,7 @@ for i in range(annotations.boxes.shape[0]):
 - `num_history_frames - 1` 取的是"现在这一帧", 与 `extract_waymo_feature.py` 里 `ego_state` 的取法一致
 - 只要 token 能被 SceneLoader 加载(stage1 或 stage2 均可), 这一步就能产出 metadata。stage2 合成帧也有 `scene.map_api`、`ego_pose` 和 `annotations`, **不依赖 `.db` 文件**
 - ① **`velocity_3d` 是 ego-local 帧**(见 `navsim_scenario_utils.py:81` 里把它再次 `rotate_vector(v, ego_heading)` 还原到全局以构造 nuPlan `Agent`), 所以和 `boxes` 的 `rel_x/rel_y/heading` 保持同一 ego-local 参考系
-- partners **不排序**; 顺序就是 `annotations.boxes` 的自然顺序, 对齐 `scenariomax/unified_to_gpudrive/convert_to_json.py:60` 里"dict 迭代顺序进 `objects` 列表"的标准约定
+- partners **不排序**; 顺序就是 `annotations.boxes` 的自然顺序。标准 ScenarioMax 流来自 `dynamic_agents` dict 迭代顺序, 两者不保证一致, 所以严格对比时应按 `track_token` 或几何位置做集合匹配
 - stage2 的 `scene.get_future_trajectory()` 会在没有未来帧时 raise, 这里显式 `try/except` 回落到 `(0, 0)`, 与 `extract_waymo_feature_stage_two.py:113-122` 的既有兜底保持一致
 
 ### 3.2 `step2_generate_gpudrive_json.py`
@@ -386,12 +389,18 @@ def simplify_geometry(points, threshold):
 
 当前版本把 ego 和所有 partner **一起**写进 JSON, 以便 Step 3 直接从 GPUDrive 的 `self_observation_tensor()` / `partner_observations_tensor()` 读出 6 维 ego 和 63×6 partner 观测, 而不再走 navsim 的直读逻辑。
 
-所有坐标都会被转写到**以 `center = ego_pose[:2]` 为原点的全局平移系**:
+所有坐标都会被转写到**以 ego box center 为原点的全局平移系**。注意: navsim 的
+`ego_pose` / `annotations.boxes[:, X/Y]` 是 ego rear-axle 参考系, 而 ScenarioMax 的
+nuPlan 抽取器使用 `EgoState.waypoint`(ego box center)作为 GPUDrive object position。
+因此 Step 2 会先用 Pacifica `rear_axle_to_center=1.461m` 把中心从 rear axle 平移到 box center:
 
-- **`extract_static_map_elements(map_api, center)` 内部就是以 `center` 为圆心做 250 m 裁剪 + 坐标平移**, 返回的 `static_map_elements` 已经是"center-平移系"的坐标
-- 因此 ego 恰好在 `(0, 0)`; partner 由"ego-local"经 `R(ego_heading)` 旋转到"center-平移系"(保持全局朝向)
+- **`extract_static_map_elements(map_api, center)` 内部就是以 ego box center 为圆心做 250 m 裁剪 + 坐标平移**, 返回的 `static_map_elements` 已经是"center-平移系"的坐标
+- 因此 ego 恰好在 `(0, 0)`; partner 先做 `rel_x -= rear_axle_to_center`, 再由"ego-local"经 `R(ego_heading)` 旋转到"center-平移系"(保持全局朝向)
+- partner 的 `type` 保留为 `vehicle` / `pedestrian` / `cyclist`; `traffic_cone` 等 GPUDrive 不支持的静态标注会跳过, 之后 `EnvConfig(remove_non_vehicles=True)` 会在 GPUDrive 侧过滤行人/骑行者
 
 ```python
+center = ego_rear_axle_global + R(ego_heading) @ [rear_axle_to_center, 0.0]
+
 def _rotate(vec_xy, heading):
     c, s = cos(heading), sin(heading)
     return c * vec_xy[0] - s * vec_xy[1], s * vec_xy[0] + c * vec_xy[1]
@@ -402,12 +411,14 @@ ego = {
     "velocity": [{"x": vx_c, "y": vy_c}] * 91,            # R(h) @ ego_velocity_local
     "valid":    [True] * 91,
     "goalPosition": {"x": gx_c, "y": gy_c, "z": 0.0},     # R(h) @ goal_local
-    "width": 1.852, "length": 4.049, "height": 1.5,
+    "width": 2.297, "length": 5.176, "height": 1.5,
     "type": "vehicle", "id": 0, "mark_as_expert": False,
 }
 
-for i, p in enumerate(partners_local[:63]):               # 不排序, 仅截 63
-    px_c, py_c = _rotate((p["rel_x"], p["rel_y"]), ego_heading)
+for i, p in enumerate(partners_local):                    # 不排序; GPUDrive 自己按 agent cap 截断
+    if p["name"] not in {"vehicle", "pedestrian", "bicycle", "cyclist"}:
+        continue
+    px_c, py_c = _rotate((p["rel_x"] - rear_axle_to_center, p["rel_y"]), ego_heading)
     vx_c, vy_c = _rotate((p["vel_x"], p["vel_y"]), ego_heading)
     head_c = p["heading"] + ego_heading
     objects.append({
@@ -417,7 +428,7 @@ for i, p in enumerate(partners_local[:63]):               # 不排序, 仅截 63
         "valid":    [True] * 91,
         "goalPosition": {"x":px_c,"y":py_c,"z":0.0},      # 无 goal, 设在自身位置
         "width": p["width"], "length": p["length"], "height": p["height"] or 1.5,
-        "type": "vehicle", "id": i+1, "mark_as_expert": False,
+        "type": gpudrive_type(p["name"]), "id": i+1, "mark_as_expert": False,
     })
 
 json = {
@@ -501,7 +512,7 @@ env = GPUDriveTorchEnv(
 3. 计算所有几何点的 `mean`, 把坐标去中心化 → 存在 `road.mean` 里(查询时再加回去)
 4. 每辆 agent 通过 KNN 空间索引取离自己最近的 200 个路段点 → `agent_roadmap_tensor`
 5. 每辆 agent 的 ego-local `self_observation` (goal/速度/碰撞位) 以及 63 个 partner 的 ego-local 观测 → `self_observation_tensor` / `partner_observations_tensor`
-6. 所有 ego-local 量都是基于每个 agent 自己的 pose 做 `减 ego 位置、旋转 -heading`, 因此 SDC 观测到的 partner 位置就是 navsim `annotations` 里的 `rel_x/rel_y`(在纯几何意义上一致)
+6. 所有 ego-local 量都是基于每个 agent 自己的 pose 做 `减 ego 位置、旋转 -heading`; 对 SDC 来说, partner 位置对应的是 ego box center local, 因此 navsim rear-axle local annotation 需要先做 `rel_x -= rear_axle_to_center`
 
 #### 3.3.3 三个抽取函数
 
@@ -528,7 +539,7 @@ stacked = torch.cat([partner_obs.speed, partner_obs.rel_pos_x, partner_obs.rel_p
                     dim=-1)                   # (num_worlds, max_agents, 63, 6)
 partner_obs_np = stacked[0, 0].cpu().numpy()  # (63, 6)
 ```
-**不按距离排序** — partner 的行顺序完全由 JSON 里 `objects` 列表的顺序决定, 即 navsim `annotations` 的自然顺序。这和标准 nuPlan → ScenarioMax → GPUDrive 流"dict 迭代顺序"保持一致。如果下游训练/评测希望按距离排序, 那是下游的事, 不应在这里动手脚。
+**不按距离排序** — partner 的行顺序完全由 JSON 里 `objects` 列表的顺序决定, 本 pipeline 是 navsim `annotations` 的自然顺序; 标准 nuPlan → ScenarioMax → GPUDrive 流是 `dynamic_agents` dict 迭代顺序。二者不保证逐行一致, 对比时不要直接 `allclose` 378 维 flatten, 应先按 id/track_token/位置匹配。
 
 **(c) `extract_road_obs(env) → (200, 13)`** — 与旧版完全一致:
 ```python
@@ -583,7 +594,7 @@ assert waymo_obs.shape == (2984,)
 
 本 token(stage1 Boston)实测:
 - 道路: 200 行中约 200 行非零(KNN 取满); 分布 `RoadLane=166, RoadEdge=31, CrossWalk=3`
-- partners: 18 行非零(= annotations 个数, 其余 45 行为 pad 零)
+- partners: 修正 type/rear-axle offset 后, 半径内车辆应为 15 行非零; 原先把行人/traffic cone 都写成 `vehicle` 时会出现 25 行非零
 - 形状与 BEV 直观对得上: 一个典型的十字路口 + 两条主干道 + ego 前方若干车辆
 
 ---
@@ -599,7 +610,7 @@ assert waymo_obs.shape == (2984,)
 | 入口数据 | `navsim Scene` (pickle 化的 navtest metadata) | nuPlan `.db` 文件 (scenario filter 过滤出来) |
 | 触达方式 | navsim `SceneLoader.get_scene_from_token(token)` | `NuPlanScenarioBuilder` + `ScenarioFilter` |
 | 地图文件 | `/data/llh/navsim_workspace/dataset/maps/*.gpkg` | 同一份 GPKG |
-| Ego pose | `scene.frames[num_history_frames-1].ego_status.ego_pose` | nuPlan scenario 的 `initial_ego_state.rear_axle` |
+| Ego pose | `scene.frames[num_history_frames-1].ego_status.ego_pose` (rear axle); Step 2 转为 ego box center | nuPlan scenario 的 `initial_ego_state.waypoint` / ego box center |
 | stage1 真实帧 | ✅ 支持 | ✅ 支持 |
 | **stage2 合成帧** | ✅ 支持 | ❌ 合成帧没有对应 `.db`, 流程断在第一步 |
 
@@ -617,7 +628,7 @@ road_features, edges = convert_map_features(static_map_elements)
 | 参数 | 本 pipeline | 标准 ScenarioMax |
 |---|---|---|
 | `map_api` | `get_maps_api(NUPLAN_MAPS_ROOT, v1.0, map_name)` | `scenario.map_api` (本质也是 `NuPlanMap` 实例) |
-| `center` | `ego_pose[:2]` (navsim 当前帧) | `scenario.initial_ego_state.rear_axle.point` (nuPlan 场景起始帧) |
+| `center` | `ego_pose[:2] + R(h) @ [rear_axle_to_center, 0]` (navsim 当前帧 ego box center) | `scenario.initial_ego_state.waypoint` (nuPlan 场景起始帧 ego box center) |
 | 半径 | 默认 250 m (函数内部固定, 无参数可调) | 默认 250 m |
 | map layers | LANE, LANE_CONNECTOR, ROADBLOCK, ROADBLOCK_CONNECTOR, STOP_LINE, CROSSWALK, INTERSECTION | 完全一样 |
 
@@ -653,7 +664,7 @@ road_features, edges = convert_map_features(static_map_elements)
 - 标准流程: C++ 读 → C++ 简化 → 建 KNN
 - 本 pipeline: Python 简化 → C++ 读(基本无活) → C++ 建 KNN
 
-所以到 KNN 以及之后的所有步骤, 两者产出**逐 bit 等价**。
+所以到 KNN 以及之后的所有步骤, road 几何在算法上应保持一致; 是否逐 bit 等价还取决于 Python/C++ 两端浮点实现和输入中心是否完全一致。
 
 ### 4.5 送入 GPUDrive 的 JSON 差异
 
@@ -665,7 +676,7 @@ road_features, edges = convert_map_features(static_map_elements)
 | `objects[0].heading`  | `[ego_heading] × 91` (当前帧 heading) | 真实 heading 轨迹 |
 | `objects[0].velocity` | `[R(h) @ ego_velocity_local] × 91` (当前帧速度重复 91 次) | 真实速度 91 帧 |
 | `objects[0].goalPosition` | `R(h) @ goal_local` (stage1 未来轨迹终点 / stage2 → `(0,0)`) | 通常是真实 scenario 的 goal |
-| `objects[1..N]` | N = `annotations` 个数(最多 63), 用自然顺序; 每个 agent 91 帧位置/速度/朝向都复制当前帧 | 所有轨迹对象, 每帧都是真实值 |
+| `objects[1..N]` | N = 支持的动态 annotation 个数, 用自然顺序; 每个 agent 91 帧位置/速度/朝向都复制当前帧; partner 位置从 rear axle local 平移到 ego-center local | 所有轨迹对象, 每帧都是真实值 |
 | `tl_states` | `{}` | 真实红绿灯 91 帧 |
 | `roads` | **完全相同** | **完全相同** |
 | `metadata.sdc_track_index` | `0` (ego 放 objects[0]) | `0` 或 ego 所在的 index |
@@ -679,25 +690,25 @@ road_features, edges = convert_map_features(static_map_elements)
 
 **road(200×13)**: 列语义 `[x, y, seg_len, seg_w, seg_h, orient, type(7)]`:
 - `seg_len, seg_w, seg_h, type` 只和道路几何有关 → 两者完全相同
-- `x, y, orient` 是 ego-local 坐标, 取决于 ego 的 `(x, y, heading)`。只要"navsim 当前帧 ego pose" == "nuplan scenario 起始帧 ego pose"(对 navtest 过滤出来的 stage1 场景成立), 两条 pipeline 的 road 块**逐 bit 等价**
+- `x, y, orient` 是 ego-local 坐标, 取决于 ego box center 的 `(x, y, heading)`。只要"navsim 当前帧 ego center" == "nuplan scenario 起始帧 ego center"(对 navtest stage1 场景应成立), 两条 pipeline 的 road 块应高度一致
 
 **ego(6)**: `[speed, length, width, rel_goal_x, rel_goal_y, is_collided]`:
 - `speed`: 都来自 `velocity.linear.length()`; 本 pipeline 用 `R(h)@ego_velocity_local` 写进去, 标准流直接写真实全局速度。`speed = |v|` 对旋转不敏感 → 两者相同
-- `length, width`: Pacifica `(4.049, 1.852)` vs nuPlan scenario 里 ego 真实尺寸, 二者一致
+- `length, width`: Pacifica `(5.176, 2.297)` vs nuPlan scenario 里 ego 真实尺寸, 二者一致
 - `rel_goal_x, rel_goal_y`: 都是"goal 的 ego-local 坐标"。本 pipeline 把 `goal_local` 旋到 center-平移系, C++ 再旋回 ego-local, 净效应 = navsim `trajectory.poses[-1, :2]` 原值。标准流是 scenario goal 的 ego-local, 对同一个 token **如果 scene 的 "当前帧 = scenario 起始帧", 且二者对 goal 定义一致, 就相同**
 - `is_collided`: step 0 都是 `False = 0.0`
 
 **partner(63×6)**: 每行 `[speed, rel_x, rel_y, orient, length, width]`:
 - `speed`: 同理与 rotation 无关, 两者相同
-- `rel_x, rel_y`: 都是 partner 的"ego-local"坐标。navsim 的 `annotations.boxes[:, X/Y]` 已经是 ego-local, 本 pipeline 把它旋到 center-平移系再交给 C++, C++ 再算回 ego-local, 净效应 = 原值。标准流直接提供 global → C++ 算 ego-local, 也得到原值 → **两者相同**
+- `rel_x, rel_y`: 标准 GPUDrive 以 ego box center 为原点。navsim 的 `annotations.boxes[:, X/Y]` 是 ego rear-axle local, 因此 Step 2 需要做 `rel_x -= rear_axle_to_center` 后再旋到 center-平移系。缺少这一步会产生稳定的约 `1.461m` longitudinal offset。
 - `orient`: navsim `annotations.boxes[:, HEADING]` 也是 ego-local, 净效应同上 → **相同**
-- `length, width`: 直接来自 `annotations.boxes` vs nuPlan agent 尺寸, 通常由同一份数据标注 → 相同
+- `length, width`: 本 pipeline 当前只能用 navsim 当前帧 annotation 尺寸; 标准 ScenarioMax 会从完整轨迹的 final valid state 取尺寸。对于 stage1 真实 nuPlan, 两者可能有小到中等差异; 若要逐对象完全一致, Step 1 需要导出按 `track_token` 聚合的多帧轨迹/尺寸。
 
-**partner 的行顺序**: 本 pipeline 用 `annotations` 的顺序, 标准流用 unified scenario 的 dict 迭代顺序。**两套顺序不一定相同**, 但本 pipeline 特意**不排序**, 以对齐 nuPlan 标准流的 "dict 迭代 → objects 列表顺序" 约定。如果下游模型关心每一行的具体归属, 需要用每行的 `id` (本 pipeline 设为 `i+1`, annotation 索引 + 1)来 cross-reference。
+**partner 的行顺序**: 本 pipeline 用 `annotations` 的顺序, 标准流用 unified scenario 的 dict 迭代顺序。**两套顺序不一定相同**。如果下游模型或验证脚本关心每一行的具体归属, 需要用每行的 `id` / `track_token` / 几何位置来 cross-reference。
 
 所以结论是:
 
-> **只要 `scene.frames[num_history_frames-1]` 的 ego 位姿 = nuPlan scenario 的起始帧 ego 位姿**(对 navtest stage1 场景成立), **两条 pipeline 输出的 2984 维观测, 在 ego(6) + road(2600) 这两块上逐 bit 等价**。partner(378) 在数值上相同, 但每一行对应的具体 agent id 可能不同(取决于两边的迭代顺序是否恰好一致)。
+> **只要 `scene.frames[num_history_frames-1]` 的 ego 位姿 = nuPlan scenario 的起始帧 ego 位姿**(对 navtest stage1 场景成立), ego/road 的主要坐标系可以对齐到 ScenarioMax/GPUDrive。partner 块需要额外注意三点: 真实 `type` 过滤、rear-axle→ego-center 平移、以及标准流的对象顺序/尺寸来自完整 trajectory, 不一定等同于 navsim 当前帧 annotation 顺序/尺寸。
 
 对 stage2 合成帧, 标准 pipeline **根本跑不通**, 本 pipeline 成为唯一可行方案。
 
@@ -766,7 +777,7 @@ exp/pipeline_output/00016f8b45c25a1d/
 | 4 | vehicle_length | m |
 | 5 | vehicle_width | m |
 
-与 `env_torch.py:834-844` 的 `PartnerObs` 6 列排列完全一致。**行顺序就是 JSON `objects` 的顺序**(= `annotations` 的自然顺序, 不按距离排序), 与标准 ScenarioMax 流保持一致。不足 63 行的部分全零填充。
+与 `env_torch.py:834-844` 的 `PartnerObs` 6 列排列完全一致。**行顺序就是 JSON `objects` 的顺序**(本 pipeline 为 `annotations` 自然顺序, 标准流为 `dynamic_agents` dict 顺序, 不按距离排序)。不足 63 行的部分全零填充。
 
 ### 5.3 `road_obs_gpudrive.npy` 的 `(200, 13)` 语义
 

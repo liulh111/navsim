@@ -7,12 +7,15 @@ carries everything downstream stages need to produce the Waymo 2984-dim
 observation via ScenarioMax + GPUDrive:
 
     - token, stage, map_name
+    - log_name, frame_token, timestamp
     - ego_pose (global [x, y, heading])
     - ego_velocity_local [vx, vy]
     - ego_size [length, width, height]
     - goal_local [gx, gy]         (stage-1: future traj endpoint; stage-2: (0,0))
-    - partners_local: list of {rel_x, rel_y, heading, vel_x, vel_y,
-                               length, width, height, name}
+    - partners_local: list of {annotation_index, rel_x, rel_y, rel_z, heading,
+                               vel_x, vel_y,
+                               length, width, height, name,
+                               instance_token, track_token}
                       — in annotation order (no distance sort, to match the
                         standard ScenarioMax → nuPlan → GPUDrive convention)
 
@@ -43,7 +46,7 @@ CONFIG_NAME = "default_run_pdm_score"
 
 OUTPUT_BASE = Path("/data/llh/navsim_workspace/exp/pipeline_output")
 
-EGO_HEIGHT = 1.5  # matches the dummy ego height used in existing step2
+DEFAULT_EGO_HEIGHT = 1.777  # Pacifica height used by nuPlan / ScenarioMax
 
 
 def _wrap_to_pi(angle: float) -> float:
@@ -59,7 +62,11 @@ def _export_one_token(scene: Scene, token: str, stage: str) -> Path:
     ego_velocity_local = frame.ego_status.ego_velocity  # [vx, vy], ego-local
 
     pacifica = get_pacifica_parameters()
-    ego_size = [float(pacifica.length), float(pacifica.width), float(EGO_HEIGHT)]
+    ego_size = [
+        float(pacifica.length),
+        float(pacifica.width),
+        float(getattr(pacifica, "height", DEFAULT_EGO_HEIGHT)),
+    ]
 
     # Goal: stage-1 uses future trajectory endpoint; stage-2 falls back to (0, 0)
     goal_local = [0.0, 0.0]
@@ -91,11 +98,23 @@ def _export_one_token(scene: Scene, token: str, stage: str) -> Path:
         boxes = annotations.boxes
         vel3d = annotations.velocity_3d
         names = list(annotations.names) if hasattr(annotations, "names") else []
+        instance_tokens = (
+            list(annotations.instance_tokens)
+            if hasattr(annotations, "instance_tokens")
+            else []
+        )
+        track_tokens = (
+            list(annotations.track_tokens)
+            if hasattr(annotations, "track_tokens")
+            else []
+        )
         for i in range(boxes.shape[0]):
             partners_local.append(
                 {
+                    "annotation_index": int(i),
                     "rel_x": float(boxes[i, BoundingBoxIndex.X]),
                     "rel_y": float(boxes[i, BoundingBoxIndex.Y]),
+                    "rel_z": float(boxes[i, BoundingBoxIndex.Z]),
                     "heading": _wrap_to_pi(float(boxes[i, BoundingBoxIndex.HEADING])),
                     "vel_x": float(vel3d[i, 0]),
                     "vel_y": float(vel3d[i, 1]),
@@ -103,12 +122,23 @@ def _export_one_token(scene: Scene, token: str, stage: str) -> Path:
                     "width": float(boxes[i, BoundingBoxIndex.WIDTH]),
                     "height": float(boxes[i, BoundingBoxIndex.HEIGHT]),
                     "name": str(names[i]) if i < len(names) else "",
+                    "instance_token": (
+                        str(instance_tokens[i]) if i < len(instance_tokens) else ""
+                    ),
+                    "track_token": (
+                        str(track_tokens[i]) if i < len(track_tokens) else ""
+                    ),
                 }
             )
 
     metadata = {
         "token": token,
         "stage": stage,
+        "log_name": scene.scene_metadata.log_name,
+        "scene_token": scene.scene_metadata.scene_token,
+        "frame_token": frame.token,
+        "current_frame_index": int(frame_idx),
+        "timestamp": int(frame.timestamp),
         "map_name": scene.scene_metadata.map_name,
         "ego_pose": [float(ego_pose[0]), float(ego_pose[1]), float(ego_pose[2])],
         "ego_velocity_local": [float(ego_velocity_local[0]), float(ego_velocity_local[1])],

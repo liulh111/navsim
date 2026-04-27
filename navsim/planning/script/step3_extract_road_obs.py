@@ -27,8 +27,10 @@ import os
 import gc
 import glob
 import argparse
+import json
 import logging
 import subprocess
+from collections import Counter
 from typing import List, Tuple
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
@@ -251,6 +253,152 @@ def visualize_road_obs(
 
 # ── Per-token pipeline ──
 
+def _single_json_path(json_dir: str) -> str:
+    matches = sorted(glob.glob(os.path.join(json_dir, "tfrecord-*.json")))
+    if not matches:
+        matches = sorted(glob.glob(os.path.join(json_dir, "*.json")))
+    if not matches:
+        raise FileNotFoundError(f"No JSON file found in {json_dir}")
+    return matches[0]
+
+
+def _load_json(path: str) -> dict:
+    with open(path) as f:
+        return json.load(f)
+
+
+def _valid_at(obj: dict, frame_idx: int = 0) -> bool:
+    valid = obj.get("valid", [])
+    return bool(valid[frame_idx]) if frame_idx < len(valid) else False
+
+
+def _pos_at(obj: dict, frame_idx: int = 0) -> np.ndarray:
+    pos = obj["position"][frame_idx]
+    return np.array([float(pos["x"]), float(pos["y"])], dtype=np.float64)
+
+
+def _heading_diff(a: float, b: float) -> float:
+    return float((float(a) - float(b) + np.pi) % (2.0 * np.pi) - np.pi)
+
+
+def summarize_json(json_path: str, label: str = "json") -> dict:
+    data = _load_json(json_path)
+    objects = data.get("objects", [])
+    roads = data.get("roads", [])
+    valid0 = [obj for obj in objects if _valid_at(obj, 0)]
+    summary = {
+        "name": data.get("name"),
+        "scenario_id": data.get("scenario_id"),
+        "objects": len(objects),
+        "valid0": len(valid0),
+        "sdc_track_index": data.get("metadata", {}).get("sdc_track_index"),
+        "object_types": Counter(obj.get("type", "") for obj in objects),
+        "valid0_types": Counter(obj.get("type", "") for obj in valid0),
+        "roads": len(roads),
+        "road_types": Counter(road.get("type", "") for road in roads),
+        "road_points": sum(len(road.get("geometry", [])) for road in roads),
+    }
+    logger.info(
+        "[%s] name=%s scenario_id=%s objects=%d valid0=%d sdc=%s roads=%d road_points=%d",
+        label,
+        summary["name"],
+        summary["scenario_id"],
+        summary["objects"],
+        summary["valid0"],
+        summary["sdc_track_index"],
+        summary["roads"],
+        summary["road_points"],
+    )
+    logger.info("[%s] object_types=%s", label, dict(summary["object_types"]))
+    logger.info("[%s] valid0_types=%s", label, dict(summary["valid0_types"]))
+    logger.info("[%s] road_types=%s", label, dict(summary["road_types"]))
+    return summary
+
+
+def compare_json_current_frame(candidate_path: str, oracle_path: str) -> None:
+    candidate = _load_json(candidate_path)
+    oracle = _load_json(oracle_path)
+    summarize_json(candidate_path, "candidate")
+    summarize_json(oracle_path, "oracle")
+
+    cand_sdc = candidate.get("metadata", {}).get("sdc_track_index", 0)
+    oracle_sdc = oracle.get("metadata", {}).get("sdc_track_index", 0)
+    cand_objs = [
+        (i, obj)
+        for i, obj in enumerate(candidate.get("objects", []))
+        if i != cand_sdc and _valid_at(obj, 0)
+    ]
+    oracle_objs = [
+        (i, obj)
+        for i, obj in enumerate(oracle.get("objects", []))
+        if i != oracle_sdc and _valid_at(obj, 0)
+    ]
+
+    used = set()
+    diffs = []
+    for oracle_idx, oracle_obj in oracle_objs:
+        oracle_pos = _pos_at(oracle_obj, 0)
+        best = None
+        for cand_idx, cand_obj in cand_objs:
+            if cand_idx in used or cand_obj.get("type") != oracle_obj.get("type"):
+                continue
+            dist = float(np.linalg.norm(_pos_at(cand_obj, 0) - oracle_pos))
+            if best is None or dist < best[0]:
+                best = (dist, cand_idx, cand_obj)
+        if best is None:
+            continue
+        used.add(best[1])
+        cand_obj = best[2]
+        diffs.append(
+            {
+                "oracle_idx": oracle_idx,
+                "candidate_idx": best[1],
+                "type": oracle_obj.get("type"),
+                "pos": best[0],
+                "heading": abs(_heading_diff(oracle_obj["heading"][0], cand_obj["heading"][0])),
+                "length": abs(float(oracle_obj["length"]) - float(cand_obj["length"])),
+                "width": abs(float(oracle_obj["width"]) - float(cand_obj["width"])),
+                "height": abs(float(oracle_obj["height"]) - float(cand_obj["height"])),
+            }
+        )
+
+    if not diffs:
+        logger.warning("No current-frame object matches found against oracle.")
+        return
+
+    logger.info(
+        "Matched current-frame non-SDC objects by nearest same-type position: %d/%d oracle, %d/%d candidate",
+        len(diffs),
+        len(oracle_objs),
+        len(used),
+        len(cand_objs),
+    )
+    for key in ["pos", "heading", "length", "width", "height"]:
+        values = np.array([d[key] for d in diffs], dtype=np.float64)
+        logger.info("  %s diff: max=%.6g mean=%.6g", key, float(values.max()), float(values.mean()))
+
+    for row in sorted(diffs, key=lambda d: d["pos"], reverse=True)[:10]:
+        logger.info(
+            "  worst pos: oracle=%s candidate=%s type=%s pos=%.4f heading=%.4g size=(%.4g, %.4g, %.4g)",
+            row["oracle_idx"],
+            row["candidate_idx"],
+            row["type"],
+            row["pos"],
+            row["heading"],
+            row["length"],
+            row["width"],
+            row["height"],
+        )
+
+
+def process_json_only(json_dir: str, oracle_json: str = "") -> None:
+    json_path = _single_json_path(json_dir)
+    if oracle_json:
+        compare_json_current_frame(json_path, oracle_json)
+    else:
+        summarize_json(json_path)
+
+
 def process_one(json_dir: str, output_dir: str):
     logger.info("=" * 72)
     logger.info(f"JSON dir:   {json_dir}")
@@ -386,6 +534,14 @@ def main():
         ),
     )
     parser.add_argument(
+        "--json_only", action="store_true",
+        help="Only summarize/compare JSON files; skip GPUDrive obs extraction.",
+    )
+    parser.add_argument(
+        "--oracle_json", default="",
+        help="Optional ScenarioMax oracle JSON for current-frame JSON comparison.",
+    )
+    parser.add_argument(
         "--limit", type=int, default=0,
         help="Only process first N scenes after discovery/filtering (0 = no limit).",
     )
@@ -408,6 +564,10 @@ def main():
         ),
     )
     args = parser.parse_args()
+
+    if args.json_only and args.isolated:
+        logger.warning("--json_only does not need subprocess isolation; disabling --isolated.")
+        args.isolated = False
 
     if args.isolated_batch_size < 1:
         logger.error("--isolated_batch_size must be >= 1")
@@ -507,7 +667,10 @@ def main():
                 break
 
             logger.info(f"\nProcessing scene #{count_done + 1} (global #{count_seen + 1})")
-            process_one(json_dir, output_dir)
+            if args.json_only:
+                process_json_only(json_dir, args.oracle_json)
+            else:
+                process_one(json_dir, output_dir)
 
             count_seen += 1
             count_done += 1
