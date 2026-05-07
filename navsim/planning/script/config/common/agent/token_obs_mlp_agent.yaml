@@ -1,0 +1,29 @@
+_target_: navsim.agents.token_obs_mlp_agent.TokenObsMLPAgent
+_convert_: 'all'
+
+obs_dir: ???
+model_module_path: ???
+model_class_name: MLP
+model_kwargs: {}
+
+# Provide either checkpoint_path or checkpoint_dir. When checkpoint_path is
+# null, the newest file matching checkpoint_glob under checkpoint_dir is used.
+checkpoint_path: null
+checkpoint_dir: ???
+checkpoint_glob: "*.pt"
+
+obs_file_pattern: "{token}.npy"
+expected_obs_dim: 2984
+trajectory_key: trajectory
+strict_load: true
+state_dict_prefixes_to_strip:
+  - agent.
+  - model.
+  - module.
+device: auto
+
+trajectory_sampling:
+  _target_: nuplan.planning.simulation.trajectory.trajectory_sampling.TrajectorySampling
+  _convert_: 'all'
+  num_poses: 40
+  interval_length: 0.1

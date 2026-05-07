@@ -1,0 +1,45 @@
+hydra:
+  run:
+    dir: ${output_dir}
+  output_subdir: ${output_dir}/code/hydra
+  searchpath:
+    - pkg://navsim.planning.script.config.common
+  job:
+    chdir: False
+
+defaults:
+  - default_common
+  - default_evaluation
+  - _self_
+  - override train_test_split: navhard_two_stage
+
+experiment_name: gpudrive_json_export
+
+# Flat directory of single-frame GPUDrive JSON files plus export_manifest.csv.
+gpudrive_json_output_dir: ${output_dir}/gpudrive_json
+
+# all | stage_one | stage_two | reactive_stage_two | non_reactive_stage_two
+export_stage: all
+
+# Keep flat by default because GPUDrive dataset loaders typically consume one
+# directory of JSON files. Set true if separate stage folders are preferred.
+separate_stage_dirs: false
+
+map_radius: 250
+dataset_name: nuPlan
+dataset_version: navsim_token_eval
+scenario_type_prefix: navsim_scene
+
+# auto: original/stage1 scenes use the last available future frame as goal;
+# synthetic/stage2 scenes use current position. Can be overridden to future/current.
+goal_source: auto
+
+# Optional ScenarioMax JSON directory. When set, existing matching files are
+# used only to align object order / ids, reproducing the validated single-token
+# export behavior. Use "auto" for ../ScenarioMax/tmp/token_obs_export.
+reference_json_dir: null
+reference_json_pattern: "{dataset_name}_{dataset_version}_{token}.json"
+align_reference_order: true
+
+overwrite: false
+pretty_json: false
