@@ -107,11 +107,28 @@ def _token_from_json(path: Path) -> str:
 
 
 def _json_files(json_dir: Path, max_scenes: int | None) -> list[Path]:
-    files = sorted(path for path in json_dir.glob("*.json") if path.is_file())
+    candidates = sorted(path for path in json_dir.glob("*.json") if path.is_file())
+    files: list[Path] = []
+    skipped: list[Path] = []
+    for path in candidates:
+        try:
+            with path.open("r", encoding="utf-8") as file:
+                data = json.load(file)
+        except json.JSONDecodeError:
+            skipped.append(path)
+            continue
+        if isinstance(data, dict) and "objects" in data and "roads" in data:
+            files.append(path)
+        else:
+            skipped.append(path)
     if max_scenes is not None:
         files = files[:max_scenes]
     if not files:
         raise FileNotFoundError(f"No JSON files found in {json_dir}")
+    if skipped:
+        skipped_names = ", ".join(path.name for path in skipped[:5])
+        suffix = "" if len(skipped) <= 5 else f", ... (+{len(skipped) - 5})"
+        print(f"Skipping {len(skipped)} non-scene JSON file(s): {skipped_names}{suffix}", flush=True)
     return files
 
 
@@ -234,7 +251,13 @@ def _run_worker(batch_files: Sequence[Path], args: argparse.Namespace, output_di
         print(result.stderr, end="", file=sys.stderr)
     if result.returncode != 0:
         rows_path.unlink(missing_ok=True)
-        raise RuntimeError(f"Worker failed with exit code {result.returncode}")
+        details = []
+        if result.stdout:
+            details.append(f"stdout:\n{result.stdout[-2000:]}")
+        if result.stderr:
+            details.append(f"stderr:\n{result.stderr[-2000:]}")
+        detail_text = "\n".join(details)
+        raise RuntimeError(f"Worker failed with exit code {result.returncode}\n{detail_text}")
     with rows_path.open("r", encoding="utf-8") as file:
         rows = json.load(file)
     rows_path.unlink(missing_ok=True)
@@ -284,7 +307,26 @@ def main() -> None:
 
         if batch_files:
             if args.subprocess_batches:
-                rows.extend(_run_worker(batch_files, args, output_dir))
+                try:
+                    rows.extend(_run_worker(batch_files, args, output_dir))
+                except Exception as batch_error:  # noqa: BLE001
+                    print(f"[WARN] worker batch {start}:{end} failed, retrying one JSON at a time: {batch_error}", flush=True)
+                    for json_path in batch_files:
+                        token = _token_from_json(json_path)
+                        npy_path = output_dir / f"{token}.npy"
+                        try:
+                            rows.extend(_run_worker([json_path], args, output_dir))
+                        except Exception as scene_error:  # noqa: BLE001
+                            rows.append(
+                                {
+                                    "token": token,
+                                    "success": False,
+                                    "status": repr(scene_error),
+                                    "json_path": str(json_path),
+                                    "npy_path": str(npy_path),
+                                    "num_controlled_agents": "",
+                                }
+                            )
             else:
                 rows.extend(_convert_files(batch_files, args, output_dir))
 
