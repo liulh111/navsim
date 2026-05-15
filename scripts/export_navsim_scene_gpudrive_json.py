@@ -25,6 +25,10 @@ DEFAULT_DATASET_NAME = "nuPlan"
 DEFAULT_DATASET_VERSION = "navsim_token_eval"
 DEFAULT_SCENARIO_TYPE_PREFIX = "navsim_scene"
 DEFAULT_MAP_RADIUS_METERS = 250
+DEFAULT_ROUTE_SEARCH_DEPTH = 30
+DEFAULT_ROUTE_GOAL_LOOKAHEAD_SECONDS = 4.0
+DEFAULT_ROUTE_GOAL_MIN_DISTANCE_METERS = 20.0
+DEFAULT_ROUTE_GOAL_MAX_DISTANCE_METERS = 40.0
 ERR_VAL = -1e4
 
 
@@ -561,15 +565,236 @@ def _extract_source_dynamic_agents(frames: list[Any], center: np.ndarray) -> dic
     return dynamic_agents
 
 
-def _scene_uses_current_position_goal(scene: Any, goal_source: str) -> bool:
-    if goal_source == "current":
-        return True
-    if goal_source == "future":
-        return False
-    return bool(
+def _load_route_dicts(map_api: Any, route_roadblock_ids: Iterable[str]) -> tuple[dict[str, Any], dict[str, Any]]:
+    from nuplan.common.maps.maps_datatypes import SemanticMapLayer
+
+    unique_route_roadblock_ids = list(dict.fromkeys(route_roadblock_ids))
+    route_roadblock_dict: dict[str, Any] = {}
+    route_lane_dict: dict[str, Any] = {}
+
+    for roadblock_id in unique_route_roadblock_ids:
+        roadblock = map_api.get_map_object(roadblock_id, SemanticMapLayer.ROADBLOCK)
+        roadblock = roadblock or map_api.get_map_object(roadblock_id, SemanticMapLayer.ROADBLOCK_CONNECTOR)
+        if roadblock is None:
+            continue
+
+        route_roadblock_dict[roadblock.id] = roadblock
+        for lane in roadblock.interior_edges:
+            route_lane_dict[lane.id] = lane
+
+    return route_roadblock_dict, route_lane_dict
+
+
+def _find_starting_lane(route_lane_dict: dict[str, Any], ego_state: Any) -> Any | None:
+    if not route_lane_dict:
+        return None
+
+    ego_xy = ego_state.rear_axle.point.array
+    ego_heading = ego_state.rear_axle.heading
+    best_lane = None
+    best_score = math.inf
+
+    for lane in route_lane_dict.values():
+        discrete_path = getattr(lane.baseline_path, "discrete_path", None)
+        if not discrete_path:
+            continue
+
+        lane_xy = np.asarray([state.point.array for state in discrete_path], dtype=np.float64)
+        distances = np.linalg.norm(lane_xy - ego_xy[None, :], axis=1)
+        nearest_index = int(np.argmin(distances))
+        heading_error = abs(float(_wrap_yaw(discrete_path[nearest_index].heading - ego_heading)))
+        score = float(distances[nearest_index] + 2.0 * heading_error)
+
+        if score < best_score:
+            best_score = score
+            best_lane = lane
+
+    return best_lane
+
+
+def _polyline_cumulative_lengths(points: np.ndarray) -> np.ndarray:
+    if len(points) == 0:
+        return np.zeros((0,), dtype=np.float64)
+    if len(points) == 1:
+        return np.zeros((1,), dtype=np.float64)
+
+    segment_lengths = np.linalg.norm(np.diff(points, axis=0), axis=1)
+    return np.concatenate([np.zeros((1,), dtype=np.float64), np.cumsum(segment_lengths, dtype=np.float64)])
+
+
+def _project_onto_polyline(points: np.ndarray, query_xy: np.ndarray) -> tuple[np.ndarray, float]:
+    if len(points) == 0:
+        raise ValueError("Polyline must contain at least one point.")
+    if len(points) == 1:
+        return np.asarray(points[0], dtype=np.float64), 0.0
+
+    cumulative_lengths = _polyline_cumulative_lengths(points)
+    best_distance = math.inf
+    best_projection = np.asarray(points[0], dtype=np.float64)
+    best_progress = 0.0
+
+    for index in range(len(points) - 1):
+        start_xy = np.asarray(points[index], dtype=np.float64)
+        end_xy = np.asarray(points[index + 1], dtype=np.float64)
+        segment = end_xy - start_xy
+        segment_length = float(np.linalg.norm(segment))
+        if segment_length < 1e-6:
+            continue
+
+        direction = segment / segment_length
+        local_t = float(np.dot(query_xy - start_xy, direction))
+        local_t = float(np.clip(local_t, 0.0, segment_length))
+        projection = start_xy + direction * local_t
+        distance = float(np.linalg.norm(query_xy - projection))
+
+        if distance < best_distance:
+            best_distance = distance
+            best_projection = projection
+            best_progress = float(cumulative_lengths[index] + local_t)
+
+    return best_projection, best_progress
+
+
+def _interpolate_polyline_at_progress(points: np.ndarray, progress: float) -> np.ndarray:
+    if len(points) == 0:
+        raise ValueError("Polyline must contain at least one point.")
+    if len(points) == 1:
+        return np.asarray(points[0], dtype=np.float64)
+
+    cumulative_lengths = _polyline_cumulative_lengths(points)
+    clamped_progress = float(np.clip(progress, 0.0, cumulative_lengths[-1]))
+    upper_index = int(np.searchsorted(cumulative_lengths, clamped_progress, side="right"))
+    upper_index = min(max(upper_index, 1), len(points) - 1)
+    lower_index = upper_index - 1
+    lower_progress = float(cumulative_lengths[lower_index])
+    upper_progress = float(cumulative_lengths[upper_index])
+
+    if upper_progress - lower_progress < 1e-6:
+        return np.asarray(points[upper_index], dtype=np.float64)
+
+    ratio = (clamped_progress - lower_progress) / (upper_progress - lower_progress)
+    return np.asarray(points[lower_index], dtype=np.float64) + ratio * (
+        np.asarray(points[upper_index], dtype=np.float64) - np.asarray(points[lower_index], dtype=np.float64)
+    )
+
+
+def _compute_route_goal_lookahead_distance(ego_speed_mps: float) -> float:
+    horizon_distance = max(0.0, ego_speed_mps) * DEFAULT_ROUTE_GOAL_LOOKAHEAD_SECONDS
+    return float(
+        np.clip(
+            horizon_distance,
+            DEFAULT_ROUTE_GOAL_MIN_DISTANCE_METERS,
+            DEFAULT_ROUTE_GOAL_MAX_DISTANCE_METERS,
+        )
+    )
+
+
+def _build_route_centerline_points(scene: Any, ego_state: Any, route_roadblock_ids: Iterable[str]) -> np.ndarray | None:
+    from navsim.planning.simulation.planner.pdm_planner.utils.graph_search.dijkstra import Dijkstra
+    from navsim.planning.simulation.planner.pdm_planner.utils.route_utils import route_roadblock_correction
+
+    if scene.map_api is None:
+        return None
+
+    route_roadblock_dict, route_lane_dict = _load_route_dicts(scene.map_api, route_roadblock_ids)
+    if not route_roadblock_dict or not route_lane_dict:
+        return None
+
+    corrected_route_ids = route_roadblock_correction(ego_state.rear_axle, scene.map_api, route_roadblock_dict)
+    route_roadblock_dict, route_lane_dict = _load_route_dicts(scene.map_api, corrected_route_ids)
+    if not route_roadblock_dict or not route_lane_dict:
+        return None
+
+    starting_lane = _find_starting_lane(route_lane_dict, ego_state)
+    if starting_lane is None:
+        return None
+
+    route_roadblocks = list(route_roadblock_dict.values())
+    route_roadblock_ids = list(route_roadblock_dict.keys())
+    start_roadblock_id = starting_lane.get_roadblock_id()
+    start_index = route_roadblock_ids.index(start_roadblock_id) if start_roadblock_id in route_roadblock_ids else 0
+    target_index = min(len(route_roadblocks) - 1, start_index + DEFAULT_ROUTE_SEARCH_DEPTH - 1)
+    target_roadblock = route_roadblocks[target_index]
+
+    graph_search = Dijkstra(starting_lane, list(route_lane_dict.keys()))
+    route_plan, path_found = graph_search.search(target_roadblock)
+    if not path_found or not route_plan:
+        route_plan = [starting_lane]
+
+    centerline_points: list[np.ndarray] = []
+    for lane in route_plan:
+        for state in lane.baseline_path.discrete_path:
+            point = np.asarray(state.point.array, dtype=np.float64)
+            if centerline_points and np.linalg.norm(point - centerline_points[-1]) < 1e-3:
+                continue
+            centerline_points.append(point)
+
+    if not centerline_points:
+        return None
+    return np.asarray(centerline_points, dtype=np.float64)
+
+
+def _extract_route_terminal_goal_position(scene: Any, current_frame_idx: int, center: np.ndarray) -> np.ndarray | None:
+    from navsim.planning.scenario_builder.navsim_scenario_utils import ego_status_to_ego_state
+    from nuplan.common.actor_state.state_representation import TimePoint
+    from nuplan.common.actor_state.vehicle_parameters import get_pacifica_parameters
+
+    if scene.map_api is None:
+        return None
+
+    current_frame = scene.frames[current_frame_idx]
+    if not current_frame.roadblock_ids:
+        return None
+
+    ego_state = ego_status_to_ego_state(
+        current_frame.ego_status,
+        get_pacifica_parameters(),
+        TimePoint(int(current_frame.timestamp)),
+    )
+    centerline_points = _build_route_centerline_points(scene, ego_state, current_frame.roadblock_ids)
+    if centerline_points is None or len(centerline_points) == 0:
+        return None
+
+    goal_xy = centerline_points[-1]
+    return np.asarray([goal_xy[0] - center[0], goal_xy[1] - center[1], 0.0], dtype=np.float32)
+
+
+def _extract_route_local_goal_position(scene: Any, current_frame_idx: int, center: np.ndarray) -> np.ndarray | None:
+    from navsim.planning.scenario_builder.navsim_scenario_utils import ego_status_to_ego_state
+    from nuplan.common.actor_state.state_representation import TimePoint
+    from nuplan.common.actor_state.vehicle_parameters import get_pacifica_parameters
+
+    if scene.map_api is None:
+        return None
+
+    current_frame = scene.frames[current_frame_idx]
+    if not current_frame.roadblock_ids:
+        return None
+
+    ego_state = ego_status_to_ego_state(
+        current_frame.ego_status,
+        get_pacifica_parameters(),
+        TimePoint(int(current_frame.timestamp)),
+    )
+    centerline_points = _build_route_centerline_points(scene, ego_state, current_frame.roadblock_ids)
+    if centerline_points is None or len(centerline_points) == 0:
+        return None
+
+    ego_xy = np.asarray(ego_state.rear_axle.point.array, dtype=np.float64)
+    _, current_progress = _project_onto_polyline(centerline_points, ego_xy)
+    ego_speed_mps = float(np.linalg.norm(np.asarray(current_frame.ego_status.ego_velocity, dtype=np.float64)))
+    target_progress = current_progress + _compute_route_goal_lookahead_distance(ego_speed_mps)
+    goal_xy = _interpolate_polyline_at_progress(centerline_points, target_progress)
+    return np.asarray([goal_xy[0] - center[0], goal_xy[1] - center[1], 0.0], dtype=np.float32)
+
+
+def _resolve_goal_source(scene: Any, goal_source: str) -> str:
+    if goal_source in {"current", "future", "route_terminal", "route_local"}:
+        return goal_source
+    return "route_local" if bool(
         scene.scene_metadata.corresponding_original_scene
         or scene.scene_metadata.corresponding_original_initial_token
-    )
+    ) else "future"
 
 
 def extract_goal_positions(
@@ -587,10 +812,22 @@ def extract_goal_positions(
     from nuplan.common.actor_state.static_object import StaticObject
     from nuplan.common.actor_state.vehicle_parameters import get_pacifica_parameters
 
-    end_frame_idx = current_frame_idx if _scene_uses_current_position_goal(scene, goal_source) else len(scene.frames) - 1
+    resolved_goal_source = _resolve_goal_source(scene, goal_source)
+    route_goal_position = None
+    if resolved_goal_source == "route_terminal":
+        route_goal_position = _extract_route_terminal_goal_position(scene, current_frame_idx, center)
+        resolved_goal_source = "current"
+    elif resolved_goal_source == "route_local":
+        route_goal_position = _extract_route_local_goal_position(scene, current_frame_idx, center)
+        resolved_goal_source = "current"
+
+    end_frame_idx = current_frame_idx if resolved_goal_source == "current" else len(scene.frames) - 1
     end_frame_idx = max(current_frame_idx, min(end_frame_idx, len(scene.frames) - 1))
     vehicle_parameters = get_pacifica_parameters()
     goal_positions: dict[str, np.ndarray] = {}
+
+    if route_goal_position is not None:
+        goal_positions["ego"] = route_goal_position
 
     for frame_idx in range(current_frame_idx, end_frame_idx + 1):
         frame = scene.frames[frame_idx]
@@ -599,14 +836,15 @@ def extract_goal_positions(
             vehicle_parameters,
             TimePoint(int(frame.timestamp)),
         )
-        goal_positions["ego"] = np.asarray(
-            [
-                ego_state.waypoint.x - center[0],
-                ego_state.waypoint.y - center[1],
-                0.0,
-            ],
-            dtype=np.float32,
-        )
+        if "ego" not in goal_positions:
+            goal_positions["ego"] = np.asarray(
+                [
+                    ego_state.waypoint.x - center[0],
+                    ego_state.waypoint.y - center[1],
+                    0.0,
+                ],
+                dtype=np.float32,
+            )
 
         detections = annotations_to_detection_tracks(frame.annotations, ego_state).tracked_objects.tracked_objects
         for tracked_object in detections:
@@ -1014,9 +1252,9 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--map-radius", type=int, default=DEFAULT_MAP_RADIUS_METERS)
     parser.add_argument(
         "--goal-source",
-        choices=["auto", "future", "current"],
+        choices=["auto", "future", "current", "route_terminal", "route_local"],
         default="auto",
-        help="auto uses future frames for original/stage1 scenes and current position for synthetic/stage2 scenes.",
+        help="auto uses future frames for original/stage1 scenes and route-local goal for synthetic/stage2 scenes.",
     )
     parser.add_argument("--dataset-name", default=DEFAULT_DATASET_NAME)
     parser.add_argument("--dataset-version", default=DEFAULT_DATASET_VERSION)
