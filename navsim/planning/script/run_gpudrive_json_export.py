@@ -76,6 +76,13 @@ def _load_reference_json_for_token(cfg: DictConfig, exporter: Any, token: str) -
     return exporter._load_reference_json(reference_path), str(reference_path)  # noqa: SLF001
 
 
+def _resolve_goal_source_for_stage(cfg: DictConfig, stage: str) -> str:
+    goal_source = str(cfg.goal_source)
+    if goal_source != "auto":
+        return goal_source
+    return "future" if stage == "stage_one" else "route_local"
+
+
 def _split_list(input_list: List[Any], num_frames: int, frame_interval: int) -> List[List[Any]]:
     return [input_list[i : i + num_frames] for i in range(0, len(input_list), frame_interval)]
 
@@ -148,17 +155,20 @@ def _export_scene(
         "sdc_track_index": -1,
         "reference_json_path": "",
         "used_reference_order": False,
+        "goal_source": "",
         "error": "",
     }
 
     try:
+        goal_source = _resolve_goal_source_for_stage(cfg, stage)
+        row["goal_source"] = goal_source
         reference_json, reference_json_path = (
             _load_reference_json_for_token(cfg, exporter, token) if bool(cfg.align_reference_order) else (None, "")
         )
         scenario_json = exporter.build_scenario_json(
             scene,
             map_radius=int(cfg.map_radius),
-            goal_source=str(cfg.goal_source),
+            goal_source=goal_source,
             dataset_name=str(cfg.dataset_name),
             dataset_version=str(cfg.dataset_version),
             scenario_type_prefix=str(cfg.scenario_type_prefix),
@@ -246,6 +256,7 @@ def export_gpudrive_json(args: List[Dict[str, Any]]) -> List[pd.DataFrame]:
                             "sdc_track_index": -1,
                             "reference_json_path": "",
                             "used_reference_order": False,
+                            "goal_source": "",
                             "error": repr(exc),
                         }
                     ]

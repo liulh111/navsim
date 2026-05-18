@@ -30,8 +30,8 @@ dataset_name: nuPlan
 dataset_version: navsim_token_eval
 scenario_type_prefix: navsim_scene
 
-# auto: original/stage1 scenes use the last available future frame as goal;
-# synthetic/stage2 scenes use current position. Can be overridden to future/current.
+# auto: stage_one uses the last available future frame as goal; stage_two uses
+# a route-local lookahead goal. Can be overridden to future/current/route_local.
 goal_source: auto
 
 # Optional ScenarioMax JSON directory. When set, existing matching files are

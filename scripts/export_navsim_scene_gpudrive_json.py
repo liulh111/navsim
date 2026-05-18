@@ -826,7 +826,8 @@ def extract_goal_positions(
     vehicle_parameters = get_pacifica_parameters()
     goal_positions: dict[str, np.ndarray] = {}
 
-    if route_goal_position is not None:
+    has_route_goal = route_goal_position is not None
+    if has_route_goal:
         goal_positions["ego"] = route_goal_position
 
     for frame_idx in range(current_frame_idx, end_frame_idx + 1):
@@ -836,7 +837,7 @@ def extract_goal_positions(
             vehicle_parameters,
             TimePoint(int(frame.timestamp)),
         )
-        if "ego" not in goal_positions:
+        if not has_route_goal and (resolved_goal_source == "future" or "ego" not in goal_positions):
             goal_positions["ego"] = np.asarray(
                 [
                     ego_state.waypoint.x - center[0],

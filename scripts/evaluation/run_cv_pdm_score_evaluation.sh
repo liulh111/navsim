@@ -1,5 +1,5 @@
 TRAIN_TEST_SPLIT=navhard_two_stage
-CACHE_PATH=YOUR_PATH_TO_METRIC_CACHE
+CACHE_PATH=$NAVSIM_EXP_ROOT/metric_cache
 SYNTHETIC_SENSOR_PATH=$OPENSCENE_DATA_ROOT/navhard_two_stage/sensor_blobs
 SYNTHETIC_SCENES_PATH=$OPENSCENE_DATA_ROOT/navhard_two_stage/synthetic_scene_pickles
 
