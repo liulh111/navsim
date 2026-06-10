@@ -1,11 +1,11 @@
 import logging
 import os
-import traceback
+import inspect
 import uuid
 from dataclasses import fields
 from datetime import datetime
 from pathlib import Path
-from typing import Dict, List, Union
+from typing import Dict, List, Optional, Union
 
 import hydra
 import numpy as np
@@ -19,7 +19,7 @@ from nuplan.planning.utils.multithreading.worker_utils import worker_map
 from omegaconf import DictConfig
 
 from navsim.agents.abstract_agent import AbstractAgent
-from navsim.common.dataclasses import PDMResults, SensorConfig
+from navsim.common.dataclasses import AgentInput, PDMResults, Scene, SensorConfig
 from navsim.common.dataloader import MetricCacheLoader, SceneFilter, SceneLoader
 from navsim.common.enums import SceneFrameType
 from navsim.evaluate.pdm_score import pdm_score
@@ -34,6 +34,21 @@ logger = logging.getLogger(__name__)
 
 CONFIG_PATH = "config/pdm_scoring"
 CONFIG_NAME = "default_run_pdm_score"
+
+
+def _compute_trajectory(
+    agent: AbstractAgent,
+    agent_input: AgentInput,
+    token: str,
+    scene: Optional[Scene] = None,
+):
+    parameters = inspect.signature(agent.compute_trajectory).parameters
+    kwargs = {"token": token} if "token" in parameters else {}
+    if agent.requires_scene:
+        if scene is None:
+            raise ValueError("Agent requires a Scene, but no Scene was provided")
+        return agent.compute_trajectory(agent_input, scene, **kwargs)
+    return agent.compute_trajectory(agent_input, **kwargs)
 
 
 def run_pdm_score(args: List[Dict[str, Union[List[str], DictConfig]]]) -> List[pd.DataFrame]:
@@ -69,6 +84,7 @@ def run_pdm_score(args: List[Dict[str, Union[List[str], DictConfig]]]) -> List[p
     scene_filter: SceneFilter = instantiate(cfg.train_test_split.scene_filter)
     scene_filter.log_names = log_names
     scene_filter.tokens = tokens
+    scene_filter.include_synthetic_scenes = False
     scene_loader = SceneLoader(
         original_sensor_path=Path(cfg.original_sensor_path),
         data_path=Path(cfg.navsim_log_path),
@@ -76,50 +92,40 @@ def run_pdm_score(args: List[Dict[str, Union[List[str], DictConfig]]]) -> List[p
         sensor_config=agent.get_sensor_config(),
     )
 
-    tokens_to_evaluate = list(set(scene_loader.tokens) & set(metric_cache_loader.tokens))
+    tokens_to_evaluate = sorted(set(scene_loader.tokens_stage_one) & set(metric_cache_loader.tokens))
     pdm_results: List[pd.DataFrame] = []
     for idx, (token) in enumerate(tokens_to_evaluate):
         logger.info(
             f"Processing scenario {idx + 1} / {len(tokens_to_evaluate)} in thread_id={thread_id}, node_id={node_id}"
         )
-        try:
-            metric_cache = metric_cache_loader.get_from_token(token)
-            agent_input = scene_loader.get_agent_input_from_token(token)
-            if agent.requires_scene:
-                scene = scene_loader.get_scene_from_token(token)
-                trajectory = agent.compute_trajectory(agent_input, scene)
-            else:
-                trajectory = agent.compute_trajectory(agent_input)
+        metric_cache = metric_cache_loader.get_from_token(token)
+        agent_input = scene_loader.get_agent_input_from_token(token)
+        scene = scene_loader.get_scene_from_token(token) if agent.requires_scene else None
+        trajectory = _compute_trajectory(agent, agent_input, token, scene)
 
-            score_row, ego_simulated_states = pdm_score(
-                metric_cache=metric_cache,
-                model_trajectory=trajectory,
-                future_sampling=simulator.proposal_sampling,
-                simulator=simulator,
-                scorer=scorer,
-                traffic_agents_policy=traffic_agents_policy,
-            )
-            score_row["valid"] = True
-            score_row["log_name"] = metric_cache.log_name
-            score_row["frame_type"] = metric_cache.scene_type
-            score_row["start_time"] = metric_cache.timepoint.time_s
-            end_pose = StateSE2(
-                x=trajectory.poses[-1, 0],
-                y=trajectory.poses[-1, 1],
-                heading=trajectory.poses[-1, 2],
-            )
-            absolute_endpoint = relative_to_absolute_poses(metric_cache.ego_state.rear_axle, [end_pose])[0]
-            score_row["endpoint_x"] = absolute_endpoint.x
-            score_row["endpoint_y"] = absolute_endpoint.y
-            score_row["start_point_x"] = metric_cache.ego_state.rear_axle.x
-            score_row["start_point_y"] = metric_cache.ego_state.rear_axle.y
-            score_row["ego_simulated_states"] = [ego_simulated_states]  # used for two-frames extended comfort
-
-        except Exception:
-            logger.warning(f"----------- Agent failed for token {token}:")
-            traceback.print_exc()
-            score_row = pd.DataFrame([PDMResults.get_empty_results()])
-            score_row["valid"] = False
+        score_row, ego_simulated_states = pdm_score(
+            metric_cache=metric_cache,
+            model_trajectory=trajectory,
+            future_sampling=simulator.proposal_sampling,
+            simulator=simulator,
+            scorer=scorer,
+            traffic_agents_policy=traffic_agents_policy,
+        )
+        score_row["valid"] = True
+        score_row["log_name"] = metric_cache.log_name
+        score_row["frame_type"] = metric_cache.scene_type
+        score_row["start_time"] = metric_cache.timepoint.time_s
+        end_pose = StateSE2(
+            x=trajectory.poses[-1, 0],
+            y=trajectory.poses[-1, 1],
+            heading=trajectory.poses[-1, 2],
+        )
+        absolute_endpoint = relative_to_absolute_poses(metric_cache.ego_state.rear_axle, [end_pose])[0]
+        score_row["endpoint_x"] = absolute_endpoint.x
+        score_row["endpoint_y"] = absolute_endpoint.y
+        score_row["start_point_x"] = metric_cache.ego_state.rear_axle.x
+        score_row["start_point_y"] = metric_cache.ego_state.rear_axle.y
+        score_row["ego_simulated_states"] = [ego_simulated_states]
         score_row["token"] = token
 
         pdm_results.append(score_row)
@@ -239,19 +245,22 @@ def main(cfg: DictConfig) -> None:
 
     # Extract scenes based on scene-loader to know which tokens to distribute across workers
     # TODO: infer the tokens per log from metadata, to not have to load metric cache and scenes here
+    scene_filter: SceneFilter = instantiate(cfg.train_test_split.scene_filter)
+    scene_filter.include_synthetic_scenes = False
     scene_loader = SceneLoader(
         original_sensor_path=None,
         data_path=Path(cfg.navsim_log_path),
-        scene_filter=instantiate(cfg.train_test_split.scene_filter),
+        scene_filter=scene_filter,
         sensor_config=SensorConfig.build_no_sensors(),
     )
     metric_cache_loader = MetricCacheLoader(Path(cfg.metric_cache_path))
 
-    tokens_to_evaluate = list(set(scene_loader.tokens) & set(metric_cache_loader.tokens))
-    num_missing_metric_cache_tokens = len(set(scene_loader.tokens) - set(metric_cache_loader.tokens))
-    num_unused_metric_cache_tokens = len(set(metric_cache_loader.tokens) - set(scene_loader.tokens))
+    stage_one_tokens = set(scene_loader.tokens_stage_one)
+    tokens_to_evaluate = sorted(stage_one_tokens & set(metric_cache_loader.tokens))
+    num_missing_metric_cache_tokens = len(stage_one_tokens - set(metric_cache_loader.tokens))
+    num_unused_metric_cache_tokens = len(set(metric_cache_loader.tokens) - stage_one_tokens)
     if num_missing_metric_cache_tokens > 0:
-        logger.warning(f"Missing metric cache for {num_missing_metric_cache_tokens} tokens. Skipping these tokens.")
+        raise FileNotFoundError(f"Missing metric cache for {num_missing_metric_cache_tokens} Stage One tokens")
     if num_unused_metric_cache_tokens > 0:
         logger.warning(f"Unused metric cache for {num_unused_metric_cache_tokens} tokens. Skipping these tokens.")
     logger.info(f"Starting pdm scoring of {len(tokens_to_evaluate)} scenarios...")
