@@ -11,7 +11,6 @@ import re
 import subprocess
 import sys
 import tempfile
-from contextlib import ExitStack
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterator, Protocol, Sequence
@@ -31,12 +30,8 @@ ROLLOUT_STEPS = 40
 NAVSIM_SAMPLE_INDICES = np.arange(5, ROLLOUT_STEPS + 1, 5)
 
 
-def _gpudrive_agent_id(raw_id: int | float) -> int:
-    """Match GPUDrive's uint32 MapObject id after it is observed as signed int32."""
-    value = int(round(float(raw_id))) & 0xFFFFFFFF
-    if value >= 0x80000000:
-        value -= 0x100000000
-    return value
+def _agent_id(raw_id: int | float) -> int:
+    return int(round(float(raw_id)))
 
 
 @dataclass
@@ -150,7 +145,7 @@ class IDMActor:
                 route_progress = torch.as_tensor(vehicle["route_progress"], dtype=torch.float32, device=device)
                 if route_xy.ndim != 2 or route_xy.shape[0] < 2:
                     continue
-                agent_id = _gpudrive_agent_id(vehicle["agent_id"])
+                agent_id = _agent_id(vehicle["agent_id"])
                 world_routes[agent_id] = IDMVehicleRoute(
                     agent_id=agent_id,
                     route_xy=route_xy,
@@ -179,7 +174,7 @@ class IDMActor:
         for world_idx, mapping in enumerate(self._mappings):
             vehicle_indices = [mapping.ego_index, *mapping.idm_indices, *mapping.static_vehicle_indices]
             for agent_idx in mapping.idm_indices:
-                agent_id = _gpudrive_agent_id(global_state.id[world_idx, agent_idx].item())
+                agent_id = _agent_id(global_state.id[world_idx, agent_idx].item())
                 route = self._routes[world_idx].get(agent_id)
                 if route is None:
                     actions[(world_idx, agent_idx)] = (0.0, 0.0)
@@ -307,20 +302,20 @@ class NavsimGpuDriveActor:
                 raise ValueError(f"World {world_idx} expected exactly one controlled ego, got {ego_indices}")
             num_scene_objects = min(len(scene_json["objects"]), global_state.id.shape[1])
             id_to_index = {
-                _gpudrive_agent_id(global_state.id[world_idx, agent_idx].item()): agent_idx
+                _agent_id(global_state.id[world_idx, agent_idx].item()): agent_idx
                 for agent_idx in range(num_scene_objects)
             }
-            idm_agent_ids = {_gpudrive_agent_id(vehicle["agent_id"]) for vehicle in sidecar.get("vehicles", {}).values()}
-            expected_controlled = {_gpudrive_agent_id(global_state.id[world_idx, ego_indices[0]].item()), *idm_agent_ids}
-            actual_controlled = {_gpudrive_agent_id(global_state.id[world_idx, idx].item()) for idx in controlled_indices}
+            idm_agent_ids = {_agent_id(vehicle["agent_id"]) for vehicle in sidecar.get("vehicles", {}).values()}
+            expected_controlled = {_agent_id(global_state.id[world_idx, ego_indices[0]].item()), *idm_agent_ids}
+            actual_controlled = {_agent_id(global_state.id[world_idx, idx].item()) for idx in controlled_indices}
             if actual_controlled != expected_controlled:
                 raise ValueError(
                     f"World {world_idx} controlled ids mismatch: expected {sorted(expected_controlled)}, "
-                    f"got {sorted(actual_controlled)}. Check sidecar agent ids and temporary controllability masking."
+                    f"got {sorted(actual_controlled)}. Regenerate JSON with contiguous ids and ego/IDM-only mark_as_expert flags."
                 )
             static_vehicle_indices = []
             for obj in scene_json["objects"]:
-                obj_id = _gpudrive_agent_id(obj["id"])
+                obj_id = _agent_id(obj["id"])
                 if obj["type"] == "vehicle" and not obj.get("is_sdc", False) and obj_id not in idm_agent_ids:
                     if obj_id in id_to_index:
                         static_vehicle_indices.append(id_to_index[obj_id])
@@ -369,7 +364,7 @@ def _infer_bicycle_actions(log_velocities: torch.Tensor, log_yaws: torch.Tensor)
 
 def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--stage", choices=("stage_one", "stage_two"), default="stage_one")
+    parser.add_argument("--stage", choices=("stage_one", "stage_two", "all"), default="stage_one")
     parser.add_argument(
         "--json-dir",
         type=Path,
@@ -432,34 +427,6 @@ def _idm_vehicle_count(path: Path) -> int:
     return len(_load_sidecar(path).get("vehicles", {}))
 
 
-def _controlled_scene_copy(scene_json: dict[str, Any], sidecar: dict[str, Any]) -> dict[str, Any]:
-    """Return a GPUDrive loading copy where only ego + IDM vehicles are controllable."""
-    idm_agent_ids = {_gpudrive_agent_id(vehicle["agent_id"]) for vehicle in sidecar.get("vehicles", {}).values()}
-    controlled_json = json.loads(json.dumps(scene_json))
-    for obj in controlled_json["objects"]:
-        obj_id = _gpudrive_agent_id(obj["id"])
-        is_ego = bool(obj.get("is_sdc", False))
-        is_idm_vehicle = obj["type"] == "vehicle" and obj_id in idm_agent_ids
-        obj["mark_as_expert"] = not (is_ego or is_idm_vehicle)
-    return controlled_json
-
-
-def _write_controlled_scene_copies(
-    paths: Sequence[Path],
-    scene_jsons: Sequence[dict[str, Any]],
-    sidecars: Sequence[dict[str, Any]],
-    temp_dir: Path,
-) -> list[Path]:
-    controlled_paths: list[Path] = []
-    for path, scene_json, sidecar in zip(paths, scene_jsons, sidecars):
-        controlled_json = _controlled_scene_copy(scene_json, sidecar)
-        controlled_path = temp_dir / path.name
-        with controlled_path.open("w", encoding="utf-8") as file:
-            json.dump(controlled_json, file)
-        controlled_paths.append(controlled_path)
-    return controlled_paths
-
-
 def _wrap_angle(angle: torch.Tensor) -> torch.Tensor:
     return torch.atan2(torch.sin(angle), torch.cos(angle))
 
@@ -514,10 +481,7 @@ def _rollout_batch(paths: Sequence[Path], args: argparse.Namespace) -> list[dict
     if len(set(idm_counts)) != 1:
         raise ValueError(f"Rollout batches must have equal idm vehicle counts, got {idm_counts}")
 
-    stack = ExitStack()
-    temp_dir = Path(stack.enter_context(tempfile.TemporaryDirectory(prefix="navhard_gpudrive_controlled_")))
-    controlled_paths = _write_controlled_scene_copies(paths, scene_jsons, sidecars, temp_dir)
-    env = _make_env(controlled_paths, args.device, max_cont_agents=1 + idm_counts[0])
+    env = _make_env(paths, args.device, max_cont_agents=1 + idm_counts[0])
     try:
         obs = env.reset(env.cont_agent_mask)
         controlled_mask = env.cont_agent_mask
@@ -594,7 +558,6 @@ def _rollout_batch(paths: Sequence[Path], args: argparse.Namespace) -> list[dict
         return rows
     finally:
         env.close()
-        stack.close()
 
 
 def _run_worker(paths: Sequence[Path], args: argparse.Namespace) -> list[dict[str, object]]:
@@ -659,43 +622,52 @@ def _write_manifest(rows: Sequence[dict[str, object]], output_dir: Path) -> None
         writer.writerows(rows)
 
 
-def main() -> None:
-    args = _parse_args()
-    if args.json_dir is None:
-        args.json_dir = WORKSPACE_ROOT / "results/gpudrive_json/navhard_two_stage" / args.stage
-    if args.output_dir is None:
-        args.output_dir = (
-            WORKSPACE_ROOT
-            / "results/gpudrive_rollouts/navhard_two_stage"
-            / args.stage
-            / f"{args.ego_policy}_idm"
-        )
-    if args.batch_size <= 0:
-        raise ValueError("--batch-size must be positive")
-    if args.max_position_error < 0 or args.max_heading_error < 0:
-        raise ValueError("Error thresholds must be non-negative")
+def _default_json_dir(stage: str) -> Path:
+    return WORKSPACE_ROOT / "results/gpudrive_json/navhard_two_stage" / stage
 
-    (args.output_dir / "raw").mkdir(parents=True, exist_ok=True)
-    (args.output_dir / "trajectories").mkdir(parents=True, exist_ok=True)
 
-    if args.worker:
-        if not args.worker_jsons or args.worker_result is None:
-            raise ValueError("Worker mode requires --worker-jsons and --worker-result")
-        rows = _rollout_batch([Path(path) for path in args.worker_jsons], args)
-        with args.worker_result.open("w", encoding="utf-8") as file:
-            json.dump(rows, file)
-        return
+def _default_output_dir(stage: str, ego_policy: str) -> Path:
+    return WORKSPACE_ROOT / "results/gpudrive_rollouts/navhard_two_stage" / stage / f"{ego_policy}_idm"
 
-    files = _json_files(args.json_dir, args.max_scenes)
+
+def _stage_json_dir(path: Path | None, stage: str) -> Path:
+    if path is None:
+        return _default_json_dir(stage)
+    if path.name == stage:
+        return path
+    return path / stage
+
+
+def _stage_output_dir(path: Path | None, stage: str, ego_policy: str, all_stages: bool) -> Path:
+    if path is None:
+        return _default_output_dir(stage, ego_policy)
+    if not all_stages:
+        return path
+    if path.name == stage:
+        return path
+    return path / stage / f"{ego_policy}_idm"
+
+
+def _run_stage(args: argparse.Namespace, stage: str, json_dir: Path, output_dir: Path) -> list[dict[str, object]]:
+    output_dir.mkdir(parents=True, exist_ok=True)
+    (output_dir / "raw").mkdir(parents=True, exist_ok=True)
+    (output_dir / "trajectories").mkdir(parents=True, exist_ok=True)
+
+    files = _json_files(json_dir, args.max_scenes)
     rows: list[dict[str, object]] = []
     pending: list[Path] = []
     for path in files:
         token = _token_from_json(path)
-        raw_path = args.output_dir / "raw" / f"{token}.npy"
-        trajectory_path = args.output_dir / "trajectories" / f"{token}.npy"
+        raw_path = output_dir / "raw" / f"{token}.npy"
+        trajectory_path = output_dir / "trajectories" / f"{token}.npy"
         if raw_path.is_file() and trajectory_path.is_file() and not args.overwrite:
             raise FileExistsError(f"Rollout already exists for {token}; use --overwrite")
         pending.append(path)
+
+    stage_args = argparse.Namespace(**vars(args))
+    stage_args.stage = stage
+    stage_args.json_dir = json_dir
+    stage_args.output_dir = output_dir
 
     grouped: dict[int, list[Path]] = {}
     for path in pending:
@@ -705,14 +677,40 @@ def main() -> None:
         group = grouped[idm_count]
         for start in range(0, len(group), args.batch_size):
             batch = group[start : start + args.batch_size]
-            rows.extend(_run_worker(batch, args))
-            _write_manifest(rows, args.output_dir)
-            print(f"[{len(rows)}/{len(pending)}] completed (idm_vehicle_count={idm_count})", flush=True)
+            rows.extend(_run_worker(batch, stage_args))
+            _write_manifest(rows, output_dir)
+            print(f"[{stage}] [{len(rows)}/{len(pending)}] completed (idm_vehicle_count={idm_count})", flush=True)
 
     if len(rows) != len(files):
         raise RuntimeError(f"Exported {len(rows)} trajectories for {len(files)} JSON files")
-    print(f"Wrote {len(rows)} rollouts to {args.output_dir}")
-    print(f"Manifest: {args.output_dir / 'manifest.csv'}")
+    print(f"Wrote {len(rows)} {stage} rollouts to {output_dir}")
+    print(f"Manifest: {output_dir / 'manifest.csv'}")
+    return rows
+
+
+def main() -> None:
+    args = _parse_args()
+    if args.batch_size <= 0:
+        raise ValueError("--batch-size must be positive")
+    if args.max_position_error < 0 or args.max_heading_error < 0:
+        raise ValueError("Error thresholds must be non-negative")
+
+    if args.worker:
+        if not args.worker_jsons or args.worker_result is None:
+            raise ValueError("Worker mode requires --worker-jsons and --worker-result")
+        rows = _rollout_batch([Path(path) for path in args.worker_jsons], args)
+        with args.worker_result.open("w", encoding="utf-8") as file:
+            json.dump(rows, file)
+        return
+
+    stages = ["stage_one", "stage_two"] if args.stage == "all" else [args.stage]
+    total_rows = 0
+    for stage in stages:
+        json_dir = _stage_json_dir(args.json_dir, stage)
+        output_dir = _stage_output_dir(args.output_dir, stage, args.ego_policy, args.stage == "all")
+        total_rows += len(_run_stage(args, stage, json_dir, output_dir))
+    if args.stage == "all":
+        print(f"Wrote {total_rows} total rollouts across stage_one and stage_two")
 
 
 if __name__ == "__main__":

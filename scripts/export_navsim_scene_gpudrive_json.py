@@ -676,7 +676,7 @@ def _apply_vehicle_export_classification(
         filtered_agents[token] = {
             **agent,
             "states": _repeat_current_state(agent["states"], num_steps),
-            "mark_as_expert": False,
+            "mark_as_expert": token not in classification.idm_vehicle_tokens,
         }
     return filtered_agents
 
@@ -1338,7 +1338,7 @@ def _extract_gpudrive_object(index: int, object_id: str, agent: dict[str, Any]) 
     goal_position = np.asarray(agent.get("goal_position", positions[final_valid_index]), dtype=np.float32)
 
     return {
-        "id": int(object_id) if str(object_id).isdigit() else index,
+        "id": index,
         "type": UNIFIED_TYPE_TO_GPUDRIVE.get(agent["type"], str(agent["type"]).lower()),
         "position": position,
         "width": _ensure_scalar(state["width"][final_valid_index]),
@@ -1392,7 +1392,10 @@ def validate_export_artifacts(
     expected_steps: int,
 ) -> None:
     objects = scenario_json["objects"]
-    object_ids = {int(obj["id"]) for obj in objects}
+    object_ids = [int(obj["id"]) for obj in objects]
+    expected_object_ids = list(range(len(objects)))
+    if object_ids != expected_object_ids:
+        raise ValueError(f"GPUDrive object IDs must be contiguous {expected_object_ids}, got {object_ids}")
     for obj in objects:
         lengths = {
             len(obj["position"]),
@@ -1406,10 +1409,20 @@ def validate_export_artifacts(
                 f"expected {expected_steps}"
             )
     route_ids = {int(agent_id) for agent_id in route_sidecar["vehicles"]}
-    if not route_ids.issubset(object_ids):
-        raise ValueError(f"IDM routes reference missing GPUDrive agent IDs: {sorted(route_ids - object_ids)}")
+    object_id_set = set(object_ids)
+    if not route_ids.issubset(object_id_set):
+        raise ValueError(f"IDM routes reference missing GPUDrive agent IDs: {sorted(route_ids - object_id_set)}")
     if len(route_ids) != len(route_sidecar["vehicles"]):
         raise ValueError("IDM route sidecar contains duplicate agent IDs")
+    for obj in objects:
+        obj_id = int(obj["id"])
+        should_be_controlled = bool(obj.get("is_sdc", False)) or obj_id in route_ids
+        if bool(obj.get("mark_as_expert", False)) == should_be_controlled:
+            expected = not should_be_controlled
+            raise ValueError(
+                f"Agent {obj_id} mark_as_expert={obj.get('mark_as_expert')} but expected {expected} "
+                "for ego/IDM-only control"
+            )
 
 
 def _current_xy(obj: dict[str, Any]) -> np.ndarray | None:
@@ -1423,7 +1436,6 @@ def align_object_order_to_reference(objects: list[dict[str, Any]], reference_obj
     """Greedily align object order to a reference JSON by type and current position."""
     remaining = set(range(len(objects)))
     aligned = []
-    matched_reference_ids = []
 
     for ref_obj in reference_objects:
         ref_xy = _current_xy(ref_obj)
@@ -1444,21 +1456,16 @@ def align_object_order_to_reference(objects: list[dict[str, Any]], reference_obj
                 best_index = candidate_index
         if best_index is not None:
             aligned.append(objects[best_index])
-            matched_reference_ids.append(ref_obj.get("id"))
             remaining.remove(best_index)
 
-    for obj, reference_id in zip(aligned, matched_reference_ids):
-        if reference_id is not None:
-            obj["id"] = reference_id
-
-    used_ids = {obj["id"] for obj in aligned}
     for index in sorted(remaining):
-        obj = objects[index]
-        while obj["id"] in used_ids:
-            obj["id"] += 1
-        used_ids.add(obj["id"])
-        aligned.append(obj)
+        aligned.append(objects[index])
     return aligned
+
+
+def _renumber_objects(objects: list[dict[str, Any]]) -> None:
+    for index, obj in enumerate(objects):
+        obj["id"] = index
 
 
 def build_export_artifacts(
@@ -1525,6 +1532,7 @@ def build_export_artifacts(
 
     if reference_json is not None and align_reference_order:
         objects = align_object_order_to_reference(objects, reference_json.get("objects", []))
+    _renumber_objects(objects)
 
     sdc_indices = [index for index, obj in enumerate(objects) if obj["is_sdc"]]
     if not sdc_indices:
