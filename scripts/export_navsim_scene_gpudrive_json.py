@@ -7,6 +7,7 @@ import argparse
 import json
 import math
 import os
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterable
 
@@ -27,6 +28,7 @@ DEFAULT_EXPORT_HORIZON_SECONDS = 4.0
 DEFAULT_TARGET_INTERVAL_SECONDS = 0.1
 DEFAULT_IDM_ROUTE_LENGTH_METERS = 80.0
 DEFAULT_IDM_SNAP_THRESHOLD_METERS = 3.0
+DEFAULT_STATIC_VEHICLE_SPEED_THRESHOLD_MPS = 0.1
 ERR_VAL = -1e4
 
 
@@ -109,6 +111,15 @@ TRAFFIC_LIGHT_STATE_TO_GPUDRIVE = {
     TRAFFIC_LIGHT_GREEN: "go",
     TRAFFIC_LIGHT_UNKNOWN: "unknown",
 }
+
+
+@dataclass
+class VehicleExportClassification:
+    idm_routes: dict[str, dict[str, Any]]
+    idm_vehicle_tokens: set[str]
+    static_vehicle_tokens: set[str]
+    dropped_vehicle_tokens: set[str]
+    current_vehicle_tokens: set[str]
 
 
 def _rotate_xy(vector: Iterable[float], angle: float) -> np.ndarray:
@@ -649,6 +660,27 @@ def _repeat_current_state(state: dict[str, np.ndarray], num_steps: int) -> dict[
     return result
 
 
+def _apply_vehicle_export_classification(
+    dynamic_agents: dict[str, dict[str, Any]],
+    classification: VehicleExportClassification,
+    num_steps: int,
+) -> dict[str, dict[str, Any]]:
+    exported_vehicle_tokens = classification.idm_vehicle_tokens | classification.static_vehicle_tokens
+    filtered_agents: dict[str, dict[str, Any]] = {}
+    for token, agent in dynamic_agents.items():
+        if token == "ego" or agent["type"] != VEHICLE:
+            filtered_agents[token] = agent
+            continue
+        if token not in exported_vehicle_tokens:
+            continue
+        filtered_agents[token] = {
+            **agent,
+            "states": _repeat_current_state(agent["states"], num_steps),
+            "mark_as_expert": False,
+        }
+    return filtered_agents
+
+
 def _tracked_object_samples(
     scene: Any,
     center: np.ndarray,
@@ -871,19 +903,21 @@ def _build_vehicle_route(
     }
 
 
-def build_idm_routes(
+def classify_vehicle_export_tokens(
     scene: Any,
     center: np.ndarray,
     *,
     minimum_length: float = DEFAULT_IDM_ROUTE_LENGTH_METERS,
     snap_threshold: float = DEFAULT_IDM_SNAP_THRESHOLD_METERS,
-) -> tuple[dict[str, dict[str, Any]], set[str]]:
+    static_speed_threshold: float = DEFAULT_STATIC_VEHICLE_SPEED_THRESHOLD_MPS,
+) -> VehicleExportClassification:
     from navsim.planning.scenario_builder.navsim_scenario_utils import (
         annotations_to_detection_tracks,
         ego_status_to_ego_state,
     )
     from nuplan.common.actor_state.oriented_box import OrientedBox
     from nuplan.common.actor_state.state_representation import StateSE2, TimePoint
+    from nuplan.common.maps.maps_datatypes import SemanticMapLayer
     from nuplan.common.actor_state.tracked_objects_types import TrackedObjectType
     from nuplan.common.actor_state.vehicle_parameters import get_pacifica_parameters
 
@@ -899,7 +933,12 @@ def build_idm_routes(
     ).tracked_objects.get_tracked_objects_of_type(TrackedObjectType.VEHICLE)
 
     routes: dict[str, dict[str, Any]] = {}
+    idm_vehicle_tokens: set[str] = set()
+    current_vehicle_tokens = {str(vehicle.track_token) for vehicle in vehicles}
     occupied_geometries = [ego_state.agent.box.geometry]
+    active_geometries: list[Any] = []
+    inactive_vehicles: list[tuple[Any, dict[str, Any] | None]] = []
+
     for vehicle in vehicles:
         route = _build_vehicle_route(
             vehicle,
@@ -908,17 +947,62 @@ def build_idm_routes(
             snap_threshold=snap_threshold,
         )
         if route is None:
+            inactive_vehicles.append((vehicle, None))
             continue
         snapped_box = OrientedBox.from_new_pose(
             vehicle.box,
             StateSE2(*route["snapped_pose"]),
         )
         if any(geometry.intersects(snapped_box.geometry) for geometry in occupied_geometries):
+            inactive_vehicles.append((vehicle, route))
             continue
         occupied_geometries.append(snapped_box.geometry)
+        active_geometries.append(snapped_box.geometry)
         route["route_xy"] = route.pop("route_xy_global") - center[None, :]
-        routes[str(vehicle.track_token)] = route
-    return routes, set(routes)
+        token = str(vehicle.track_token)
+        routes[token] = route
+        idm_vehicle_tokens.add(token)
+
+    static_vehicle_tokens: set[str] = set()
+    for vehicle, route in inactive_vehicles:
+        token = str(vehicle.track_token)
+        collides_with_active = any(vehicle.box.geometry.intersects(geometry) for geometry in active_geometries)
+        if collides_with_active:
+            continue
+
+        is_stationary = float(vehicle.velocity.magnitude()) < static_speed_threshold
+        is_in_lanes = scene.map_api.is_in_layer(vehicle.center, SemanticMapLayer.LANE) or scene.map_api.is_in_layer(
+            vehicle.center, SemanticMapLayer.INTERSECTION
+        )
+
+        lateral_deviation = None
+        if route is not None:
+            lateral_deviation = route["snap_distance"]
+        else:
+            from nuplan.planning.simulation.observation.idm.idm_agents_builder import get_starting_segment
+
+            lane, _ = get_starting_segment(vehicle, scene.map_api)
+            if lane is not None:
+                state_on_path = lane.baseline_path.get_nearest_pose_from_position(vehicle.center)
+                lateral_deviation = float(
+                    np.hypot(state_on_path.x - vehicle.center.x, state_on_path.y - vehicle.center.y)
+                )
+
+        if is_stationary and not is_in_lanes:
+            static_vehicle_tokens.add(token)
+            continue
+        if lateral_deviation is not None and lateral_deviation > snap_threshold:
+            static_vehicle_tokens.add(token)
+
+    exported_vehicle_tokens = idm_vehicle_tokens | static_vehicle_tokens
+    dropped_vehicle_tokens = current_vehicle_tokens - exported_vehicle_tokens
+    return VehicleExportClassification(
+        idm_routes=routes,
+        idm_vehicle_tokens=idm_vehicle_tokens,
+        static_vehicle_tokens=static_vehicle_tokens,
+        dropped_vehicle_tokens=dropped_vehicle_tokens,
+        current_vehicle_tokens=current_vehicle_tokens,
+    )
 
 
 def _load_route_dicts(map_api: Any, route_roadblock_ids: Iterable[str]) -> tuple[dict[str, Any], dict[str, Any]]:
@@ -1416,12 +1500,13 @@ def build_export_artifacts(
         if object_id in goal_positions:
             agent["goal_position"] = goal_positions[object_id]
 
-    current_vehicle_tokens = {
-        token
-        for token, agent in dynamic_agents.items()
-        if token != "ego" and agent["type"] == VEHICLE and bool(agent["states"]["valid"][0])
-    }
-    idm_routes, routed_vehicle_tokens = build_idm_routes(scene, center)
+    vehicle_classification = classify_vehicle_export_tokens(scene, center)
+    dynamic_agents = _apply_vehicle_export_classification(
+        dynamic_agents,
+        vehicle_classification,
+        len(target_times),
+    )
+    idm_routes = vehicle_classification.idm_routes
 
     static_map_elements = extract_static_map_elements(scene.map_api, center, map_radius)
     roads, _ = convert_map_features(static_map_elements)
@@ -1493,8 +1578,15 @@ def build_export_artifacts(
         "horizon": float(horizon),
         "minimum_route_length": DEFAULT_IDM_ROUTE_LENGTH_METERS,
         "snap_threshold": DEFAULT_IDM_SNAP_THRESHOLD_METERS,
-        "current_vehicle_count": len(current_vehicle_tokens),
-        "filtered_vehicle_count": len(current_vehicle_tokens - routed_vehicle_tokens),
+        "current_vehicle_count": len(vehicle_classification.current_vehicle_tokens),
+        "idm_vehicle_count": len(vehicle_classification.idm_vehicle_tokens),
+        "static_vehicle_count": len(vehicle_classification.static_vehicle_tokens),
+        "dropped_vehicle_count": len(vehicle_classification.dropped_vehicle_tokens),
+        "filtered_vehicle_count": len(vehicle_classification.dropped_vehicle_tokens),
+        "current_vehicle_track_tokens": sorted(vehicle_classification.current_vehicle_tokens),
+        "idm_vehicle_track_tokens": sorted(vehicle_classification.idm_vehicle_tokens),
+        "static_vehicle_track_tokens": sorted(vehicle_classification.static_vehicle_tokens),
+        "dropped_vehicle_track_tokens": sorted(vehicle_classification.dropped_vehicle_tokens),
         "vehicles": route_entries,
     }
     _strip_internal_object_fields(objects)

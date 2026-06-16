@@ -5,6 +5,7 @@ import json
 import logging
 import os
 import pickle
+import sys
 import traceback
 import uuid
 from pathlib import Path
@@ -40,6 +41,7 @@ def _load_single_token_exporter() -> Any:
     if spec is None or spec.loader is None:
         raise ImportError(f"Could not import exporter module from {exporter_path}")
     module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
     spec.loader.exec_module(module)
     return module
 
@@ -161,7 +163,10 @@ def _export_scene(
         "used_reference_order": False,
         "goal_source": "",
         "route_sidecar_path": "",
+        "num_current_vehicles": 0,
         "num_idm_vehicles": 0,
+        "num_static_vehicles": 0,
+        "num_dropped_vehicles": 0,
         "num_filtered_vehicles": 0,
         "num_expert_vru": 0,
         "expert_vru_horizon": 0.0,
@@ -220,7 +225,10 @@ def _export_scene(
             len(scenario_json["objects"][0]["position"]) if scenario_json["objects"] else 0
         )
         row["source"] = scenario_json["metadata"].get("source", "synthetic_scene")
+        row["num_current_vehicles"] = route_sidecar.get("current_vehicle_count", 0)
         row["num_idm_vehicles"] = len(route_sidecar["vehicles"])
+        row["num_static_vehicles"] = route_sidecar.get("static_vehicle_count", 0)
+        row["num_dropped_vehicles"] = route_sidecar.get("dropped_vehicle_count", 0)
         row["num_filtered_vehicles"] = route_sidecar["filtered_vehicle_count"]
         row["num_expert_vru"] = sum(
             obj["type"] in {"pedestrian", "cyclist"} and obj["mark_as_expert"]
@@ -301,7 +309,10 @@ def export_gpudrive_json(args: List[Dict[str, Any]]) -> List[pd.DataFrame]:
                             "num_steps": 0,
                             "source": "",
                             "route_sidecar_path": "",
+                            "num_current_vehicles": 0,
                             "num_idm_vehicles": 0,
+                            "num_static_vehicles": 0,
+                            "num_dropped_vehicles": 0,
                             "num_filtered_vehicles": 0,
                             "num_expert_vru": 0,
                             "expert_vru_horizon": 0.0,
