@@ -15,7 +15,7 @@ defaults:
 
 experiment_name: gpudrive_json_export
 
-# Flat directory of single-frame GPUDrive JSON files plus export_manifest.csv.
+# Flat directory of 4-second GPUDrive JSON files, IDM route sidecars, and export_manifest.csv.
 gpudrive_json_output_dir: ${output_dir}/gpudrive_json
 
 # all | stage_one | stage_two | reactive_stage_two | non_reactive_stage_two
@@ -26,6 +26,8 @@ export_stage: all
 separate_stage_dirs: false
 
 map_radius: 250
+target_interval: 0.1
+horizon: 4.0
 dataset_name: nuPlan
 dataset_version: navsim_token_eval
 scenario_type_prefix: navsim_scene

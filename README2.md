@@ -16,6 +16,13 @@ python scripts/export_navhard_stage_one_gpudrive_json.py \
 --output-dir ../results/gpudrive_json/navhard_two_stage/stage_one \
 --nuplan-maps-root ../dataset/maps
 
+第一，二步：直接出GPUDrive json
+conda run -n navsim python navsim/planning/script/run_gpudrive_json_export.py \
+export_stage=all \
+separate_stage_dirs=true \
+gpudrive_json_output_dir=/data/llh/navsim_workspace/results/gpudrive_json/navhard_two_stage \
+overwrite=true
+
 第三步：GPUDrive中rollout
 conda run -n gpudrive python navsim/scripts/run_navhard_stage_one_gpudrive_rollout.py
 

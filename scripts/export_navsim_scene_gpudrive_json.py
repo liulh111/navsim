@@ -1,11 +1,5 @@
 #!/usr/bin/env python
-"""Export one NAVSIM scene token to a ScenarioMax/GPUDrive-style JSON file.
-
-This is intentionally scoped to token-level alignment work.  It reads a NAVSIM
-Scene, uses the current frame as the origin, extracts only that current frame's
-dynamic agents and map features, then writes the same top-level JSON schema
-produced by ScenarioMax's nuPlan -> GPUDrive exporter.
-"""
+"""Export one NAVSIM scene token to GPUDrive JSON and IDM route metadata."""
 
 from __future__ import annotations
 
@@ -29,6 +23,10 @@ DEFAULT_ROUTE_SEARCH_DEPTH = 30
 DEFAULT_ROUTE_GOAL_LOOKAHEAD_SECONDS = 4.0
 DEFAULT_ROUTE_GOAL_MIN_DISTANCE_METERS = 20.0
 DEFAULT_ROUTE_GOAL_MAX_DISTANCE_METERS = 40.0
+DEFAULT_EXPORT_HORIZON_SECONDS = 4.0
+DEFAULT_TARGET_INTERVAL_SECONDS = 0.1
+DEFAULT_IDM_ROUTE_LENGTH_METERS = 80.0
+DEFAULT_IDM_SNAP_THRESHOLD_METERS = 3.0
 ERR_VAL = -1e4
 
 
@@ -565,6 +563,364 @@ def _extract_source_dynamic_agents(frames: list[Any], center: np.ndarray) -> dic
     return dynamic_agents
 
 
+def _scene_is_synthetic(scene: Any) -> bool:
+    metadata = scene.scene_metadata
+    return bool(
+        metadata.corresponding_original_scene
+        or metadata.corresponding_original_initial_token
+        or metadata.num_future_frames == 0
+    )
+
+
+def _target_times(horizon: float, interval: float) -> np.ndarray:
+    if horizon <= 0 or interval <= 0:
+        raise ValueError("horizon and target interval must be positive")
+    num_steps = int(round(horizon / interval)) + 1
+    if num_steps > 91:
+        raise ValueError(f"GPUDrive supports at most 91 trajectory states, got {num_steps}")
+    return np.arange(num_steps, dtype=np.float64) * interval
+
+
+def _source_times(frames: list[Any], current_timestamp: int) -> np.ndarray:
+    return np.asarray([(int(frame.timestamp) - current_timestamp) * 1e-6 for frame in frames], dtype=np.float64)
+
+
+def _resample_agent_state(
+    state: dict[str, np.ndarray],
+    source_times: np.ndarray,
+    target_times: np.ndarray,
+    *,
+    max_gap: float,
+) -> dict[str, np.ndarray]:
+    result = _empty_agent_state(len(target_times))
+    valid_indices = np.flatnonzero(state["valid"].astype(bool))
+    if len(valid_indices) == 0:
+        return result
+
+    valid_times = source_times[valid_indices]
+    valid_headings = np.unwrap(state["heading"][valid_indices].astype(np.float64))
+    exact_tolerance = 1e-4
+
+    for target_index, target_time in enumerate(target_times):
+        exact = np.flatnonzero(np.abs(valid_times - target_time) <= exact_tolerance)
+        if len(exact):
+            source_index = valid_indices[int(exact[0])]
+            for key in ("position", "velocity", "length", "width", "height"):
+                result[key][target_index] = state[key][source_index]
+            result["heading"][target_index] = _wrap_yaw(state["heading"][source_index])
+            result["valid"][target_index] = 1.0
+            continue
+
+        upper = int(np.searchsorted(valid_times, target_time, side="right"))
+        if upper == 0 or upper >= len(valid_times):
+            continue
+        lower = upper - 1
+        lower_time = float(valid_times[lower])
+        upper_time = float(valid_times[upper])
+        if upper_time - lower_time > max_gap + 1e-6:
+            continue
+
+        ratio = (target_time - lower_time) / (upper_time - lower_time)
+        lower_index = valid_indices[lower]
+        upper_index = valid_indices[upper]
+        for key in ("position", "velocity", "length", "width", "height"):
+            result[key][target_index] = (
+                state[key][lower_index]
+                + ratio * (state[key][upper_index] - state[key][lower_index])
+            )
+        result["heading"][target_index] = _wrap_yaw(
+            valid_headings[lower] + ratio * (valid_headings[upper] - valid_headings[lower])
+        )
+        result["valid"][target_index] = 1.0
+
+    return result
+
+
+def _repeat_current_state(state: dict[str, np.ndarray], num_steps: int) -> dict[str, np.ndarray]:
+    result = _empty_agent_state(num_steps)
+    valid_indices = np.flatnonzero(state["valid"].astype(bool))
+    if len(valid_indices) == 0:
+        return result
+    source_index = int(valid_indices[0])
+    for key in ("position", "velocity", "length", "width", "height"):
+        result[key][:] = state[key][source_index]
+    result["heading"][:] = state["heading"][source_index]
+    result["valid"][:] = 1.0
+    return result
+
+
+def _tracked_object_samples(
+    scene: Any,
+    center: np.ndarray,
+    current_timestamp: int,
+) -> dict[str, dict[str, Any]]:
+    """Collect pedestrian/cyclist samples from current and extended detections."""
+    from navsim.planning.scenario_builder.navsim_scenario_utils import (
+        annotations_to_detection_tracks,
+        ego_status_to_ego_state,
+    )
+    from nuplan.common.actor_state.state_representation import TimePoint
+    from nuplan.common.actor_state.vehicle_parameters import get_pacifica_parameters
+
+    current_index = scene.scene_metadata.num_history_frames - 1
+    current_frame = scene.frames[current_index]
+    ego_state = ego_status_to_ego_state(
+        current_frame.ego_status,
+        get_pacifica_parameters(),
+        TimePoint(int(current_frame.timestamp)),
+    )
+    observations: list[tuple[float, list[Any]]] = [
+        (
+            0.0,
+            list(
+                annotations_to_detection_tracks(
+                    current_frame.annotations, ego_state
+                ).tracked_objects.tracked_objects
+            ),
+        )
+    ]
+    for detections in scene.extended_detections_tracks or []:
+        objects = list(detections.tracked_objects.tracked_objects)
+        timestamps = [int(obj.metadata.timestamp_us) for obj in objects]
+        if not timestamps:
+            continue
+        observations.append(((min(timestamps) - current_timestamp) * 1e-6, objects))
+
+    samples: dict[str, dict[str, Any]] = {}
+    for time_s, objects in observations:
+        for obj in objects:
+            type_name = str(obj.tracked_object_type.name).lower()
+            unified_type = NAVSIM_AGENT_TYPE_TO_UNIFIED.get(type_name)
+            if unified_type not in {PEDESTRIAN, CYCLIST}:
+                continue
+            token = str(obj.track_token)
+            entry = samples.setdefault(token, {"type": unified_type, "samples": []})
+            velocity = getattr(obj, "velocity", None)
+            entry["samples"].append(
+                {
+                    "time": float(time_s),
+                    "position": np.asarray(
+                        [obj.center.x - center[0], obj.center.y - center[1], 0.0],
+                        dtype=np.float32,
+                    ),
+                    "heading": float(obj.center.heading),
+                    "velocity": np.asarray(
+                        [velocity.x, velocity.y] if velocity is not None else [0.0, 0.0],
+                        dtype=np.float32,
+                    ),
+                    "length": float(obj.box.length),
+                    "width": float(obj.box.width),
+                    "height": float(obj.box.height),
+                }
+            )
+    return samples
+
+
+def _resample_vru_samples(
+    samples: dict[str, dict[str, Any]],
+    target_times: np.ndarray,
+    source_interval: float,
+) -> dict[str, dict[str, Any]]:
+    agents: dict[str, dict[str, Any]] = {}
+    for token, entry in samples.items():
+        ordered = sorted(entry["samples"], key=lambda sample: sample["time"])
+        deduplicated = []
+        for sample in ordered:
+            if deduplicated and math.isclose(sample["time"], deduplicated[-1]["time"], abs_tol=1e-4):
+                deduplicated[-1] = sample
+            else:
+                deduplicated.append(sample)
+        source_times = np.asarray([sample["time"] for sample in deduplicated], dtype=np.float64)
+        state = _empty_agent_state(len(deduplicated))
+        for index, sample in enumerate(deduplicated):
+            for key in ("position", "velocity", "length", "width", "height"):
+                state[key][index] = sample[key]
+            state["heading"][index] = sample["heading"]
+            state["valid"][index] = 1.0
+        agents[token] = {
+            "type": entry["type"],
+            "states": _resample_agent_state(
+                state,
+                source_times,
+                target_times,
+                max_gap=source_interval * 1.1,
+            ),
+            "mark_as_expert": True,
+        }
+    return agents
+
+
+def build_dynamic_agents(
+    scene: Any,
+    center: np.ndarray,
+    *,
+    horizon: float,
+    target_interval: float,
+) -> tuple[dict[str, dict[str, Any]], np.ndarray, str]:
+    current_index = scene.scene_metadata.num_history_frames - 1
+    current_frame = scene.frames[current_index]
+    target_times = _target_times(horizon, target_interval)
+    synthetic = _scene_is_synthetic(scene)
+
+    if synthetic:
+        current_agents = _extract_source_dynamic_agents([current_frame], center)
+        dynamic_agents = {}
+        for token, agent in current_agents.items():
+            if agent["type"] in {PEDESTRIAN, CYCLIST}:
+                continue
+            dynamic_agents[token] = {
+                **agent,
+                "states": _repeat_current_state(agent["states"], len(target_times)),
+                "mark_as_expert": False,
+            }
+        dynamic_agents.update(
+            _resample_vru_samples(
+                _tracked_object_samples(scene, center, int(current_frame.timestamp)),
+                target_times,
+                source_interval=0.5,
+            )
+        )
+        return dynamic_agents, target_times, "synthetic_current_plus_extended_vru"
+
+    future_end = min(
+        len(scene.frames),
+        current_index + int(round(horizon / 0.5)) + 1,
+    )
+    source_frames = scene.frames[current_index:future_end]
+    source_agents = _extract_source_dynamic_agents(source_frames, center)
+    source_times = _source_times(source_frames, int(current_frame.timestamp))
+    source_interval = float(np.median(np.diff(source_times))) if len(source_times) > 1 else 0.5
+    dynamic_agents = {}
+    for token, agent in source_agents.items():
+        dynamic_agents[token] = {
+            **agent,
+            "states": _resample_agent_state(
+                agent["states"],
+                source_times,
+                target_times,
+                max_gap=source_interval * 1.1,
+            ),
+            "mark_as_expert": agent["type"] in {PEDESTRIAN, CYCLIST},
+        }
+    return dynamic_agents, target_times, "navsim_future_log"
+
+
+def _append_route_points(points: list[np.ndarray], lane: Any) -> None:
+    for pose in lane.baseline_path.discrete_path:
+        point = np.asarray([pose.x, pose.y], dtype=np.float64)
+        if points and np.linalg.norm(point - points[-1]) < 1e-3:
+            continue
+        points.append(point)
+
+
+def _build_vehicle_route(
+    vehicle: Any,
+    map_api: Any,
+    *,
+    minimum_length: float,
+    snap_threshold: float,
+) -> dict[str, Any] | None:
+    from nuplan.planning.simulation.observation.idm.idm_agents_builder import get_starting_segment
+
+    lane, initial_progress = get_starting_segment(vehicle, map_api)
+    if lane is None or initial_progress is None:
+        return None
+    snapped_pose = lane.baseline_path.get_nearest_pose_from_position(vehicle.center.point)
+    snap_distance = float(
+        np.hypot(snapped_pose.x - vehicle.center.x, snapped_pose.y - vehicle.center.y)
+    )
+    if snap_distance > snap_threshold:
+        return None
+
+    route_lanes = [lane]
+    points: list[np.ndarray] = []
+    _append_route_points(points, lane)
+    accumulated = _polyline_cumulative_lengths(np.asarray(points, dtype=np.float64))
+    remaining = float(accumulated[-1] - initial_progress) if len(accumulated) else 0.0
+    while remaining < minimum_length and len(route_lanes) < 100:
+        outgoing = list(route_lanes[-1].outgoing_edges)
+        if not outgoing:
+            break
+        next_lane = min(
+            outgoing,
+            key=lambda edge: abs(edge.baseline_path.get_curvature_at_arc_length(0.0)),
+        )
+        route_lanes.append(next_lane)
+        _append_route_points(points, next_lane)
+        accumulated = _polyline_cumulative_lengths(np.asarray(points, dtype=np.float64))
+        remaining = float(accumulated[-1] - initial_progress)
+
+    route_xy = np.asarray(points, dtype=np.float64)
+    if len(route_xy) < 2:
+        return None
+    progress = _polyline_cumulative_lengths(route_xy)
+    deltas = np.diff(route_xy, axis=0)
+    headings = np.arctan2(deltas[:, 1], deltas[:, 0])
+    headings = np.concatenate([headings, headings[-1:]])
+    return {
+        "track_token": str(vehicle.track_token),
+        "route_xy_global": route_xy,
+        "route_heading": headings,
+        "route_progress": progress,
+        "initial_progress": float(initial_progress),
+        "snap_distance": snap_distance,
+        "snapped_pose": np.asarray(
+            [snapped_pose.x, snapped_pose.y, snapped_pose.heading], dtype=np.float64
+        ),
+        "lane_ids": [str(route_lane.id) for route_lane in route_lanes],
+    }
+
+
+def build_idm_routes(
+    scene: Any,
+    center: np.ndarray,
+    *,
+    minimum_length: float = DEFAULT_IDM_ROUTE_LENGTH_METERS,
+    snap_threshold: float = DEFAULT_IDM_SNAP_THRESHOLD_METERS,
+) -> tuple[dict[str, dict[str, Any]], set[str]]:
+    from navsim.planning.scenario_builder.navsim_scenario_utils import (
+        annotations_to_detection_tracks,
+        ego_status_to_ego_state,
+    )
+    from nuplan.common.actor_state.oriented_box import OrientedBox
+    from nuplan.common.actor_state.state_representation import StateSE2, TimePoint
+    from nuplan.common.actor_state.tracked_objects_types import TrackedObjectType
+    from nuplan.common.actor_state.vehicle_parameters import get_pacifica_parameters
+
+    current_index = scene.scene_metadata.num_history_frames - 1
+    current_frame = scene.frames[current_index]
+    ego_state = ego_status_to_ego_state(
+        current_frame.ego_status,
+        get_pacifica_parameters(),
+        TimePoint(int(current_frame.timestamp)),
+    )
+    vehicles = annotations_to_detection_tracks(
+        current_frame.annotations, ego_state
+    ).tracked_objects.get_tracked_objects_of_type(TrackedObjectType.VEHICLE)
+
+    routes: dict[str, dict[str, Any]] = {}
+    occupied_geometries = [ego_state.agent.box.geometry]
+    for vehicle in vehicles:
+        route = _build_vehicle_route(
+            vehicle,
+            scene.map_api,
+            minimum_length=minimum_length,
+            snap_threshold=snap_threshold,
+        )
+        if route is None:
+            continue
+        snapped_box = OrientedBox.from_new_pose(
+            vehicle.box,
+            StateSE2(*route["snapped_pose"]),
+        )
+        if any(geometry.intersects(snapped_box.geometry) for geometry in occupied_geometries):
+            continue
+        occupied_geometries.append(snapped_box.geometry)
+        route["route_xy"] = route.pop("route_xy_global") - center[None, :]
+        routes[str(vehicle.track_token)] = route
+    return routes, set(routes)
+
+
 def _load_route_dicts(map_api: Any, route_roadblock_ids: Iterable[str]) -> tuple[dict[str, Any], dict[str, Any]]:
     from nuplan.common.maps.maps_datatypes import SemanticMapLayer
 
@@ -913,8 +1269,9 @@ def _extract_gpudrive_object(index: int, object_id: str, agent: dict[str, Any]) 
             "z": _ensure_scalar(goal_position[2]),
         },
         "is_sdc": object_id == "ego",
-        "mark_as_expert": False,
+        "mark_as_expert": bool(agent.get("mark_as_expert", False)),
         "total_distance_traveled": _object_distance_traveled(positions, valids),
+        "_track_token": object_id,
     }
 
 
@@ -938,6 +1295,37 @@ def convert_dynamic_agents(dynamic_agents: dict[str, dict[str, Any]]) -> tuple[l
             objects.append(obj)
 
     return objects, distances
+
+
+def _strip_internal_object_fields(objects: list[dict[str, Any]]) -> None:
+    for obj in objects:
+        obj.pop("_track_token", None)
+
+
+def validate_export_artifacts(
+    scenario_json: dict[str, Any],
+    route_sidecar: dict[str, Any],
+    expected_steps: int,
+) -> None:
+    objects = scenario_json["objects"]
+    object_ids = {int(obj["id"]) for obj in objects}
+    for obj in objects:
+        lengths = {
+            len(obj["position"]),
+            len(obj["heading"]),
+            len(obj["velocity"]),
+            len(obj["valid"]),
+        }
+        if lengths != {expected_steps}:
+            raise ValueError(
+                f"Agent {obj['id']} has inconsistent trajectory lengths {sorted(lengths)}; "
+                f"expected {expected_steps}"
+            )
+    route_ids = {int(agent_id) for agent_id in route_sidecar["vehicles"]}
+    if not route_ids.issubset(object_ids):
+        raise ValueError(f"IDM routes reference missing GPUDrive agent IDs: {sorted(route_ids - object_ids)}")
+    if len(route_ids) != len(route_sidecar["vehicles"]):
+        raise ValueError("IDM route sidecar contains duplicate agent IDs")
 
 
 def _current_xy(obj: dict[str, Any]) -> np.ndarray | None:
@@ -989,7 +1377,7 @@ def align_object_order_to_reference(objects: list[dict[str, Any]], reference_obj
     return aligned
 
 
-def build_scenario_json(
+def build_export_artifacts(
     scene: Any,
     *,
     map_radius: int,
@@ -999,7 +1387,9 @@ def build_scenario_json(
     scenario_type_prefix: str,
     reference_json: dict[str, Any] | None,
     align_reference_order: bool,
-) -> dict[str, Any]:
+    target_interval: float = DEFAULT_TARGET_INTERVAL_SECONDS,
+    horizon: float = DEFAULT_EXPORT_HORIZON_SECONDS,
+) -> tuple[dict[str, Any], dict[str, Any]]:
     from navsim.planning.scenario_builder.navsim_scenario_utils import ego_status_to_ego_state
     from nuplan.common.actor_state.state_representation import TimePoint
     from nuplan.common.actor_state.vehicle_parameters import get_pacifica_parameters
@@ -1008,7 +1398,6 @@ def build_scenario_json(
     if current_frame_idx >= len(scene.frames):
         raise ValueError("The NAVSIM scene has no frames from the current frame onward.")
     current_frame = scene.frames[current_frame_idx]
-    frames = [current_frame]
     vehicle_parameters = get_pacifica_parameters()
     current_ego_state = ego_status_to_ego_state(
         current_frame.ego_status,
@@ -1016,17 +1405,37 @@ def build_scenario_json(
         TimePoint(int(current_frame.timestamp)),
     )
     center = np.asarray([current_ego_state.waypoint.x, current_ego_state.waypoint.y], dtype=np.float64)
-    target_times = np.asarray([0.0], dtype=np.float32)
-
-    dynamic_agents = _extract_source_dynamic_agents(frames, center)
+    dynamic_agents, target_times, trajectory_source = build_dynamic_agents(
+        scene,
+        center,
+        horizon=horizon,
+        target_interval=target_interval,
+    )
     goal_positions = extract_goal_positions(scene, current_frame_idx, center, goal_source)
     for object_id, agent in dynamic_agents.items():
         if object_id in goal_positions:
             agent["goal_position"] = goal_positions[object_id]
 
+    current_vehicle_tokens = {
+        token
+        for token, agent in dynamic_agents.items()
+        if token != "ego" and agent["type"] == VEHICLE and bool(agent["states"]["valid"][0])
+    }
+    idm_routes, routed_vehicle_tokens = build_idm_routes(scene, center)
+
     static_map_elements = extract_static_map_elements(scene.map_api, center, map_radius)
     roads, _ = convert_map_features(static_map_elements)
-    tl_states = convert_traffic_lights(extract_dynamic_map_elements(frames, scene.map_api, center, target_times))
+    traffic_light_frames = scene.frames[current_frame_idx : current_frame_idx + len(target_times)]
+    if not traffic_light_frames:
+        traffic_light_frames = [current_frame]
+    tl_states = convert_traffic_lights(
+        extract_dynamic_map_elements(
+            traffic_light_frames,
+            scene.map_api,
+            center,
+            target_times,
+        )
+    )
     objects, distances = convert_dynamic_agents(dynamic_agents)
 
     if reference_json is not None and align_reference_order:
@@ -1040,7 +1449,7 @@ def build_scenario_json(
     export_file_name = f"{dataset_name}_{dataset_version}_{scenario_id}"
     average_distance = float(np.mean(distances)) if distances else 0.0
 
-    return {
+    scenario_json = {
         "name": f"{export_file_name}.json",
         "scenario_id": scenario_id,
         "objects": objects,
@@ -1055,8 +1464,70 @@ def build_scenario_json(
             "tracks_to_predict": [],
             "average_distance_traveled": average_distance,
             "scenario_type": f"{scenario_type_prefix}+{scenario_id}",
+            "source": trajectory_source,
+            "target_interval": float(target_interval),
+            "horizon": float(horizon),
         },
     }
+    route_entries: dict[str, dict[str, Any]] = {}
+    for obj in objects:
+        track_token = str(obj.get("_track_token", ""))
+        if track_token not in idm_routes:
+            continue
+        route = idm_routes[track_token]
+        route_entries[str(obj["id"])] = {
+            "agent_id": int(obj["id"]),
+            "track_token": track_token,
+            "route_xy": route["route_xy"],
+            "route_heading": route["route_heading"],
+            "route_progress": route["route_progress"],
+            "initial_progress": route["initial_progress"],
+            "snap_distance": route["snap_distance"],
+            "lane_ids": route["lane_ids"],
+        }
+
+    route_sidecar = {
+        "scene_id": scenario_id,
+        "coordinate_frame": "gpudrive_json",
+        "target_interval": float(target_interval),
+        "horizon": float(horizon),
+        "minimum_route_length": DEFAULT_IDM_ROUTE_LENGTH_METERS,
+        "snap_threshold": DEFAULT_IDM_SNAP_THRESHOLD_METERS,
+        "current_vehicle_count": len(current_vehicle_tokens),
+        "filtered_vehicle_count": len(current_vehicle_tokens - routed_vehicle_tokens),
+        "vehicles": route_entries,
+    }
+    _strip_internal_object_fields(objects)
+    validate_export_artifacts(scenario_json, route_sidecar, len(target_times))
+    return scenario_json, route_sidecar
+
+
+def build_scenario_json(
+    scene: Any,
+    *,
+    map_radius: int,
+    goal_source: str,
+    dataset_name: str,
+    dataset_version: str,
+    scenario_type_prefix: str,
+    reference_json: dict[str, Any] | None,
+    align_reference_order: bool,
+    target_interval: float = DEFAULT_TARGET_INTERVAL_SECONDS,
+    horizon: float = DEFAULT_EXPORT_HORIZON_SECONDS,
+) -> dict[str, Any]:
+    scenario_json, _ = build_export_artifacts(
+        scene,
+        map_radius=map_radius,
+        goal_source=goal_source,
+        dataset_name=dataset_name,
+        dataset_version=dataset_version,
+        scenario_type_prefix=scenario_type_prefix,
+        reference_json=reference_json,
+        align_reference_order=align_reference_order,
+        target_interval=target_interval,
+        horizon=horizon,
+    )
+    return scenario_json
 
 
 def _load_navsim_scene(args: argparse.Namespace) -> Any:
@@ -1251,6 +1722,8 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--frame-interval", type=int, default=1)
     parser.add_argument("--allow-missing-route", action="store_true")
     parser.add_argument("--map-radius", type=int, default=DEFAULT_MAP_RADIUS_METERS)
+    parser.add_argument("--target-interval", type=float, default=DEFAULT_TARGET_INTERVAL_SECONDS)
+    parser.add_argument("--horizon", type=float, default=DEFAULT_EXPORT_HORIZON_SECONDS)
     parser.add_argument(
         "--goal-source",
         choices=["auto", "future", "current", "route_terminal", "route_local"],
@@ -1279,9 +1752,13 @@ def main() -> None:
     os.environ["NUPLAN_MAPS_ROOT"] = str(args.maps_root)
     os.environ.setdefault("MPLCONFIGDIR", "/tmp")
 
-    reference_json = _load_reference_json(args.reference_json)
+    reference_json = (
+        _load_reference_json(args.reference_json)
+        if not args.no_align_reference_order
+        else None
+    )
     scene = _load_navsim_scene(args)
-    scenario_json = build_scenario_json(
+    scenario_json, route_sidecar = build_export_artifacts(
         scene,
         map_radius=args.map_radius,
         goal_source=args.goal_source,
@@ -1290,6 +1767,8 @@ def main() -> None:
         scenario_type_prefix=args.scenario_type_prefix,
         reference_json=reference_json,
         align_reference_order=not args.no_align_reference_order,
+        target_interval=args.target_interval,
+        horizon=args.horizon,
     )
 
     args.output_dir.mkdir(parents=True, exist_ok=True)
@@ -1299,9 +1778,17 @@ def main() -> None:
             json.dump(_jsonable(scenario_json), file, indent=2)
         else:
             json.dump(_jsonable(scenario_json), file)
+    route_path = output_path.with_suffix(".idm_routes.json")
+    with route_path.open("w", encoding="utf-8") as file:
+        if args.pretty:
+            json.dump(_jsonable(route_sidecar), file, indent=2)
+        else:
+            json.dump(_jsonable(route_sidecar), file)
 
     summary = _summary(scenario_json, reference_json)
     summary["json_path"] = str(output_path)
+    summary["route_sidecar_path"] = str(route_path)
+    summary["idm_vehicles"] = len(route_sidecar["vehicles"])
     print(json.dumps(_jsonable(summary), indent=2))
 
 

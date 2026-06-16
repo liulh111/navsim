@@ -5,8 +5,6 @@ import json
 import logging
 import os
 import pickle
-import subprocess
-import tempfile
 import traceback
 import uuid
 from pathlib import Path
@@ -31,21 +29,10 @@ CONFIG_PATH = "config/gpudrive_json_export"
 CONFIG_NAME = "default_run_gpudrive_json_export"
 
 
-def _workspace_root() -> Path:
-    return Path(__file__).resolve().parents[4]
-
-
-def _resolve_workspace_path(path: Any) -> Path:
-    resolved = Path(str(path)).expanduser()
-    if not resolved.is_absolute():
-        resolved = _workspace_root() / resolved
-    return resolved.resolve()
-
-
 def _load_single_token_exporter() -> Any:
     """Load the NAVSIM synthetic-scene exporter."""
     repo_root = Path(__file__).resolve().parents[3]
-    exporter_path = repo_root / "scripts" / "export_navsim_scene_gpudrive_json_logs.py"
+    exporter_path = repo_root / "scripts" / "export_navsim_scene_gpudrive_json.py"
     if not exporter_path.is_file():
         raise FileNotFoundError(f"Could not find single-token exporter at {exporter_path}")
 
@@ -104,7 +91,7 @@ def _split_list(input_list: List[Any], num_frames: int, frame_interval: int) -> 
     return [input_list[i : i + num_frames] for i in range(0, len(input_list), frame_interval)]
 
 
-def _iter_stage_one_records(cfg: DictConfig, data_point: Dict[str, Any]) -> List[tuple[str, Dict[str, Any]]]:
+def _iter_stage_one_scenes(cfg: DictConfig, data_point: Dict[str, Any]) -> List[tuple[str, Scene]]:
     scene_filter: SceneFilter = instantiate(cfg.train_test_split.scene_filter)
     requested_tokens = set(data_point["tokens"])
     log_name = data_point["log_file"]
@@ -112,7 +99,7 @@ def _iter_stage_one_records(cfg: DictConfig, data_point: Dict[str, Any]) -> List
 
     with log_path.open("rb") as file:
         scene_dict_list = pickle.load(file)
-    records: List[tuple[str, Dict[str, Any]]] = []
+    scenes: List[tuple[str, Scene]] = []
     for frame_list in _split_list(scene_dict_list, scene_filter.num_frames, scene_filter.frame_interval):
         if len(frame_list) < scene_filter.num_frames:
             continue
@@ -123,18 +110,19 @@ def _iter_stage_one_records(cfg: DictConfig, data_point: Dict[str, Any]) -> List
         if token not in requested_tokens:
             continue
 
-        current_frame = frame_list[scene_filter.num_history_frames - 1]
-        records.append(
+        scenes.append(
             (
                 token,
-                {
-                    "log_name": current_frame["log_name"],
-                    "timestamp": int(current_frame["timestamp"]),
-                    "map_name": current_frame["map_location"],
-                },
+                Scene.from_scene_dict_list(
+                    frame_list,
+                    sensor_blobs_path=Path(cfg.original_sensor_path),
+                    num_history_frames=scene_filter.num_history_frames,
+                    num_future_frames=scene_filter.num_future_frames,
+                    sensor_config=SensorConfig.build_no_sensors(),
+                ),
             )
         )
-    return records
+    return scenes
 
 
 def _iter_stage_two_scenes(cfg: DictConfig, data_point: Dict[str, Any]) -> List[tuple[str, Scene]]:
@@ -172,6 +160,13 @@ def _export_scene(
         "reference_json_path": "",
         "used_reference_order": False,
         "goal_source": "",
+        "route_sidecar_path": "",
+        "num_idm_vehicles": 0,
+        "num_filtered_vehicles": 0,
+        "num_expert_vru": 0,
+        "expert_vru_horizon": 0.0,
+        "num_steps": 0,
+        "source": "",
         "error": "",
     }
 
@@ -181,7 +176,7 @@ def _export_scene(
         reference_json, reference_json_path = (
             _load_reference_json_for_token(cfg, exporter, token) if bool(cfg.align_reference_order) else (None, "")
         )
-        scenario_json = exporter.build_scenario_json(
+        scenario_json, route_sidecar = exporter.build_export_artifacts(
             scene,
             map_radius=int(cfg.map_radius),
             goal_source=goal_source,
@@ -191,13 +186,16 @@ def _export_scene(
             reference_json=reference_json,
             align_reference_order=bool(cfg.align_reference_order),
             target_interval=float(cfg.target_interval),
+            horizon=float(cfg.horizon),
         )
         output_path = _output_path_for_token(cfg, scenario_json, stage)
+        route_path = output_path.with_suffix(".idm_routes.json")
         row["json_path"] = str(output_path)
+        row["route_sidecar_path"] = str(route_path)
         row["reference_json_path"] = reference_json_path
         row["used_reference_order"] = reference_json is not None
 
-        if output_path.exists() and not bool(cfg.overwrite):
+        if output_path.exists() and route_path.exists() and not bool(cfg.overwrite):
             row["valid"] = True
             row["skipped_existing"] = True
         else:
@@ -206,6 +204,11 @@ def _export_scene(
                     json.dump(exporter._jsonable(scenario_json), file, indent=2)
                 else:
                     json.dump(exporter._jsonable(scenario_json), file)
+            with route_path.open("w", encoding="utf-8") as file:
+                if bool(cfg.pretty_json):
+                    json.dump(exporter._jsonable(route_sidecar), file, indent=2)
+                else:
+                    json.dump(exporter._jsonable(route_sidecar), file)
             row["valid"] = True
             row["skipped_existing"] = False
 
@@ -217,148 +220,27 @@ def _export_scene(
             len(scenario_json["objects"][0]["position"]) if scenario_json["objects"] else 0
         )
         row["source"] = scenario_json["metadata"].get("source", "synthetic_scene")
+        row["num_idm_vehicles"] = len(route_sidecar["vehicles"])
+        row["num_filtered_vehicles"] = route_sidecar["filtered_vehicle_count"]
+        row["num_expert_vru"] = sum(
+            obj["type"] in {"pedestrian", "cyclist"} and obj["mark_as_expert"]
+            for obj in scenario_json["objects"]
+        )
+        row["expert_vru_horizon"] = max(
+            (
+                max(index for index, valid in enumerate(obj["valid"]) if valid)
+                * float(cfg.target_interval)
+                for obj in scenario_json["objects"]
+                if obj["type"] in {"pedestrian", "cyclist"}
+                and obj["mark_as_expert"]
+                and any(obj["valid"])
+            ),
+            default=0.0,
+        )
 
     except Exception as exc:  # noqa: BLE001
         logger.warning("Failed to export token %s", token)
         traceback.print_exc()
-        row["error"] = repr(exc)
-
-    return pd.DataFrame([row])
-
-
-def _export_stage_one_record(
-    cfg: DictConfig,
-    token: str,
-    record: Dict[str, Any],
-) -> pd.DataFrame:
-    row: Dict[str, Any] = {
-        "token": token,
-        "stage": "stage_one",
-        "valid": False,
-        "json_path": "",
-        "num_objects": 0,
-        "num_roads": 0,
-        "num_tl_states": 0,
-        "sdc_track_index": -1,
-        "reference_json_path": "",
-        "used_reference_order": False,
-        "goal_source": "scenario_max",
-        "num_steps": 0,
-        "source": "nuplan_db",
-        "scenariomax_log_path": "",
-        "error": "",
-    }
-
-    try:
-        output_dir = _stage_output_dir(cfg, "stage_one")
-        output_path = output_dir / f"{cfg.dataset_name}_{cfg.dataset_version}_{token}.json"
-        log_path = output_path.with_suffix(".log")
-        row["json_path"] = str(output_path)
-        row["scenariomax_log_path"] = str(log_path)
-
-        if output_path.exists() and not bool(cfg.overwrite):
-            with output_path.open("r", encoding="utf-8") as file:
-                scenario_json = json.load(file)
-            row["skipped_existing"] = True
-        else:
-            row["skipped_existing"] = False
-            scenariomax_root = _resolve_workspace_path(cfg.scenariomax_root)
-            exporter_path = scenariomax_root / "scripts" / "export_nuplan_token_obs.py"
-            scenariomax_python = _resolve_workspace_path(cfg.scenariomax_python)
-            if not exporter_path.is_file():
-                raise FileNotFoundError(f"Could not find ScenarioMax exporter at {exporter_path}")
-            if not scenariomax_python.is_file():
-                raise FileNotFoundError(
-                    f"Could not find ScenarioMax Python at {scenariomax_python}. "
-                    "Set SCENARIOMAX_PYTHON or override scenariomax_python."
-                )
-
-            with tempfile.TemporaryDirectory(prefix=f"scenariomax_{token}_", dir="/tmp") as temp_dir:
-                command = [
-                    str(scenariomax_python),
-                    str(exporter_path),
-                    "--nuplan-data-root",
-                    str(_resolve_workspace_path(cfg.nuplan_data_root)),
-                    "--nuplan-maps-root",
-                    str(_resolve_workspace_path(cfg.nuplan_maps_root)),
-                    "--log-name",
-                    str(record["log_name"]),
-                    "--token",
-                    token,
-                    "--timestamp",
-                    str(record["timestamp"]),
-                    "--map-name",
-                    str(record["map_name"]),
-                    "--map-version",
-                    "nuplan-maps-v1.0",
-                    "--scenario-duration",
-                    str(cfg.scenario_duration),
-                    "--subsample-ratio",
-                    str(cfg.subsample_ratio),
-                    "--dataset-version",
-                    str(cfg.dataset_version),
-                    "--output-dir",
-                    temp_dir,
-                    "--export-mode",
-                    "json",
-                ]
-                process = subprocess.run(
-                    command,
-                    cwd=scenariomax_root,
-                    env={**os.environ, "MPLCONFIGDIR": "/tmp"},
-                    capture_output=True,
-                    text=True,
-                    check=False,
-                )
-                log_path.write_text(
-                    f"Command: {' '.join(command)}\n\n"
-                    f"STDOUT:\n{process.stdout}\n\nSTDERR:\n{process.stderr}",
-                    encoding="utf-8",
-                )
-                if process.returncode != 0:
-                    raise RuntimeError(
-                        f"ScenarioMax exited with code {process.returncode}; see {log_path}"
-                    )
-
-                generated_path = Path(temp_dir) / output_path.name
-                if not generated_path.is_file():
-                    matches = list(Path(temp_dir).glob(f"*_{cfg.dataset_version}_{token}.json"))
-                    if len(matches) != 1:
-                        raise FileNotFoundError(
-                            f"ScenarioMax did not produce a JSON for {token}; see {log_path}"
-                        )
-                    generated_path = matches[0]
-                with generated_path.open("r", encoding="utf-8") as file:
-                    scenario_json = json.load(file)
-
-        num_steps = len(scenario_json["objects"][0]["position"]) if scenario_json["objects"] else 0
-        expected_steps = int(
-            round(float(cfg.scenario_duration) / (0.05 / float(cfg.subsample_ratio)))
-        )
-        if num_steps != expected_steps or num_steps > 91:
-            raise ValueError(
-                f"ScenarioMax Stage One export must contain {expected_steps} steps "
-                f"and at most 91, got {num_steps}"
-            )
-
-        if not row["skipped_existing"]:
-            with output_path.open("w", encoding="utf-8") as file:
-                json.dump(
-                    scenario_json,
-                    file,
-                    indent=2 if bool(cfg.pretty_json) else None,
-                )
-
-        row["valid"] = True
-        row["num_objects"] = len(scenario_json["objects"])
-        row["num_roads"] = len(scenario_json["roads"])
-        row["num_tl_states"] = len(scenario_json["tl_states"])
-        row["sdc_track_index"] = scenario_json["metadata"]["sdc_track_index"]
-        row["num_steps"] = num_steps
-    except Exception as exc:  # noqa: BLE001
-        logger.warning("Failed to export Stage One token %s", token)
-        traceback.print_exc()
-        row["valid"] = False
         row["error"] = repr(exc)
 
     return pd.DataFrame([row])
@@ -382,28 +264,11 @@ def export_gpudrive_json(args: List[Dict[str, Any]]) -> List[pd.DataFrame]:
         try:
             kind = data_point["kind"]
             stage = "stage_one" if kind == "stage_one" else "stage_two"
-            if kind == "stage_one":
-                records = _iter_stage_one_records(cfg, data_point)
-                for idx, (token, record) in enumerate(records):
-                    logger.info(
-                        "Exporting %s %s (%s/%s) in thread_id=%s, node_id=%s",
-                        stage,
-                        token,
-                        idx + 1,
-                        len(records),
-                        thread_id,
-                        node_id,
-                    )
-                    rows.append(
-                        _export_stage_one_record(
-                            cfg,
-                            token,
-                            record,
-                        )
-                    )
-                continue
-
-            scenes = _iter_stage_two_scenes(cfg, data_point)
+            scenes = (
+                _iter_stage_one_scenes(cfg, data_point)
+                if kind == "stage_one"
+                else _iter_stage_two_scenes(cfg, data_point)
+            )
             for idx, (token, scene) in enumerate(scenes):
                 logger.info(
                     "Exporting %s %s (%s/%s) in thread_id=%s, node_id=%s",
@@ -435,7 +300,11 @@ def export_gpudrive_json(args: List[Dict[str, Any]]) -> List[pd.DataFrame]:
                             "goal_source": "",
                             "num_steps": 0,
                             "source": "",
-                            "scenariomax_log_path": "",
+                            "route_sidecar_path": "",
+                            "num_idm_vehicles": 0,
+                            "num_filtered_vehicles": 0,
+                            "num_expert_vru": 0,
+                            "expert_vru_horizon": 0.0,
                             "error": repr(exc),
                         }
                     ]
