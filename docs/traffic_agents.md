@@ -17,7 +17,7 @@ NAVSIM v2 introduces support for **reactive traffic agents**, allowing surroundi
 
 ### Selecting a Traffic Agents Policy
 
-For single-stage simulation, you can specify the traffic agent policy by providing an override when running the evaluation script `navsim/planning/script/run_pdm_score_one_stage.py`.
+For single-stage simulation, you can specify the traffic agent policy by providing an override when running the generic evaluation script `navsim/planning/script/run_pdm_score.py`.
 
 An example can be found in the commented section of the script `run_cv_pdm_score_evaluation.sh`. For instance:
 

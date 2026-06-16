@@ -14,17 +14,17 @@ defaults:
   - _self_
   - override train_test_split: navhard_two_stage
 
-experiment_name: offline_trajectory_stage_one
+experiment_name: gpudrive_two_stage_pdm_score
 
-agent:
-  _target_: navsim.agents.offline_trajectory_agent.OfflineTrajectoryAgent
+stage_one_trajectory_dir: ???
+stage_two_trajectory_dir: ???
+strict_trajectory_files: true
+
+trajectory_sampling:
+  _target_: nuplan.planning.simulation.trajectory.trajectory_sampling.TrajectorySampling
   _convert_: 'all'
-  trajectory_dir: ???
-  trajectory_sampling:
-    _target_: nuplan.planning.simulation.trajectory.trajectory_sampling.TrajectorySampling
-    _convert_: 'all'
-    num_poses: 8
-    interval_length: 0.5
+  num_poses: 8
+  interval_length: 0.5
 
 simulator:
   _target_: navsim.planning.simulation.planner.pdm_planner.simulation.pdm_simulator.PDMSimulator
