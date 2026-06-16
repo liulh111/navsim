@@ -25,7 +25,23 @@ overwrite=true
 
 第三步：GPUDrive中rollout
 conda run -n gpudrive python navsim/scripts/run_navhard_stage_one_gpudrive_rollout.py
+cd /data/llh/navsim_workspace/navsim
 
+conda run -n gpudrive python navsim/scripts/run_navhard_stage_one_gpudrive_rollout.py \
+--json-dir /data/llh/navsim_workspace/results/gpudrive_json/navhard_two_stage/stage_one \
+--output-dir /data/llh/navsim_workspace/results/gpudrive_rollouts/navhard_two_stage/stage_one/expert_bicycle_idm \
+--batch-size 16 \
+--ego-policy expert_bicycle \
+--device cpu \
+--overwrite
+
+conda run -n gpudrive python navsim/scripts/run_navhard_stage_one_gpudrive_rollout.py \
+--json-dir /data/llh/navsim_workspace/results/gpudrive_json/navhard_two_stage/stage_two \
+--output-dir /data/llh/navsim_workspace/results/gpudrive_rollouts/navhard_two_stage/stage_two/expert_bicycle_idm \
+--batch-size 16 \
+--ego-policy expert_bicycle \
+--device cpu \
+--overwrite
 第四步：评估结果
 
 conda run -n navsim-llm python \
