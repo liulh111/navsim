@@ -310,6 +310,27 @@ def _build_data_points(
     return data_points
 
 
+def _get_tokens_list_per_log(scene_loader: SceneLoader) -> Dict[str, List[str]]:
+    """Group scene tokens by log name, preserving synthetic initial tokens."""
+    tokens_per_logs: Dict[str, List[str]] = {}
+    for token, scene_dict_list in scene_loader.scene_frames_dicts.items():
+        log_name = scene_dict_list[0]["log_name"]
+        tokens_per_logs.setdefault(log_name, []).append(token)
+
+    for token, (_, log_name) in scene_loader.synthetic_scenes.items():
+        tokens_per_logs.setdefault(log_name, []).append(token)
+
+    return tokens_per_logs
+
+
+def _count_distributed_tokens(
+    data_points: List[Dict[str, Union[List[str], DictConfig]]],
+) -> Tuple[int, int]:
+    stage_one_count = sum(len(data_point["stage_one_tokens"]) for data_point in data_points)
+    stage_two_count = sum(len(data_point["stage_two_tokens"]) for data_point in data_points)
+    return stage_one_count, stage_two_count
+
+
 def _make_mapping(
     raw_mapping: Iterable[Tuple[str, str, Iterable[Iterable[str]]]], scored_tokens: set[str]
 ) -> Dict[Tuple[str, str], List[Tuple[str, str]]]:
@@ -410,16 +431,13 @@ def _format_metric_table(pdm_score_df: pd.DataFrame) -> str:
         "stage_two": "extended_pdm_score_stage_two",
         "combined": "extended_pdm_score_combined",
     }
-    metrics = [
-        "score",
-        "no_at_fault_collisions",
-        "drivable_area_compliance",
-        "driving_direction_compliance",
-        "ego_progress",
-        "time_to_collision_within_bound",
-        "history_comfort",
-        "two_frame_extended_comfort",
-    ]
+    metric_names = set()
+    for column in pdm_score_df.columns:
+        if column.endswith("_stage_one"):
+            metric_names.add(column[: -len("_stage_one")])
+        elif column.endswith("_stage_two"):
+            metric_names.add(column[: -len("_stage_two")])
+    metrics = ["score"] + sorted(metric_names)
 
     table = pd.DataFrame(index=rows.keys(), columns=metrics, dtype=float)
 
@@ -602,7 +620,7 @@ def main(cfg: DictConfig) -> None:
         cfg,
         stage_one_eval_tokens,
         stage_two_eval_tokens,
-        scene_loader.get_tokens_list_per_log(),
+        _get_tokens_list_per_log(scene_loader),
         show_progress=show_progress,
     )
     if not data_points:
@@ -610,7 +628,18 @@ def main(cfg: DictConfig) -> None:
             f"No GPUDrive {evaluation_stage} PDM scoring jobs were built. "
             "Check evaluation_stage, trajectory directories, and scene filter tokens."
         )
-    logger.info(f"Built {len(data_points)} GPUDrive PDM scoring jobs.")
+    distributed_stage_one_count, distributed_stage_two_count = _count_distributed_tokens(data_points)
+    logger.info(
+        f"Built {len(data_points)} GPUDrive PDM scoring jobs with "
+        f"{distributed_stage_one_count} stage one and {distributed_stage_two_count} stage two tokens."
+    )
+    if stage_one_eval_tokens and distributed_stage_one_count == 0:
+        raise RuntimeError("Stage one trajectories are available, but no stage one tokens were distributed.")
+    if stage_two_eval_tokens and distributed_stage_two_count == 0:
+        raise RuntimeError(
+            "Stage two trajectories are available, but no stage two tokens were distributed. "
+            "Check synthetic scene token grouping."
+        )
     score_rows: List[pd.DataFrame] = worker_map(worker, run_gpudrive_two_stage_pdm_score, data_points)
     pdm_score_df = pd.concat(score_rows, ignore_index=True)
 
