@@ -18,7 +18,9 @@ experiment_name: gpudrive_two_stage_pdm_score
 
 stage_one_trajectory_dir: ???
 stage_two_trajectory_dir: ???
+evaluation_stage: all  # all, stage_one, or stage_two
 strict_trajectory_files: true
+show_progress: true
 
 trajectory_sampling:
   _target_: nuplan.planning.simulation.trajectory.trajectory_sampling.TrajectorySampling

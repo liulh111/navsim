@@ -24,6 +24,7 @@ if str(GPUDRIVE_ROOT) not in sys.path:
 
 import numpy as np
 import torch
+from tqdm import tqdm
 
 TOKEN_RE = re.compile(r"([0-9a-fA-F]{16,})$")
 ROLLOUT_STEPS = 40
@@ -382,6 +383,7 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--overwrite", action="store_true")
     parser.add_argument("--max-position-error", type=float, default=5.0)
     parser.add_argument("--max-heading-error", type=float, default=0.1)
+    parser.add_argument("--no-progress", action="store_true", help="Disable tqdm progress bars")
     parser.add_argument("--worker", action="store_true", help=argparse.SUPPRESS)
     parser.add_argument("--worker-jsons", nargs="*", default=None, help=argparse.SUPPRESS)
     parser.add_argument("--worker-result", type=Path, default=None, help=argparse.SUPPRESS)
@@ -393,9 +395,19 @@ def _token_from_json(path: Path) -> str:
     return match.group(1).lower() if match else path.stem
 
 
-def _json_files(json_dir: Path, max_scenes: int | None) -> list[Path]:
+def _progress(iterable, *, disable: bool, **kwargs):
+    return tqdm(iterable, disable=disable, dynamic_ncols=True, **kwargs)
+
+
+def _json_files(json_dir: Path, max_scenes: int | None, disable_progress: bool = False) -> list[Path]:
     files: list[Path] = []
-    for path in sorted(json_dir.glob("*.json")):
+    json_paths = sorted(json_dir.glob("*.json"))
+    for path in _progress(
+        json_paths,
+        disable=disable_progress,
+        desc=f"Scanning {json_dir.name}",
+        unit="file",
+    ):
         with path.open("r", encoding="utf-8") as file:
             data = json.load(file)
         if isinstance(data, dict) and "objects" in data and "roads" in data:
@@ -583,9 +595,9 @@ def _run_worker(paths: Sequence[Path], args: argparse.Namespace) -> list[dict[st
         str(args.max_position_error),
         "--max-heading-error",
         str(args.max_heading_error),
-        "--worker-jsons",
-        *[str(path) for path in paths],
     ]
+    command.append("--no-progress")
+    command.extend(["--worker-jsons", *[str(path) for path in paths]])
     result = subprocess.run(command, text=True, capture_output=True, check=False)
     if result.stdout:
         print(result.stdout, end="")
@@ -653,10 +665,15 @@ def _run_stage(args: argparse.Namespace, stage: str, json_dir: Path, output_dir:
     (output_dir / "raw").mkdir(parents=True, exist_ok=True)
     (output_dir / "trajectories").mkdir(parents=True, exist_ok=True)
 
-    files = _json_files(json_dir, args.max_scenes)
+    files = _json_files(json_dir, args.max_scenes, disable_progress=args.no_progress)
     rows: list[dict[str, object]] = []
     pending: list[Path] = []
-    for path in files:
+    for path in _progress(
+        files,
+        disable=args.no_progress,
+        desc=f"{stage}: checking outputs",
+        unit="scene",
+    ):
         token = _token_from_json(path)
         raw_path = output_dir / "raw" / f"{token}.npy"
         trajectory_path = output_dir / "trajectories" / f"{token}.npy"
@@ -670,16 +687,35 @@ def _run_stage(args: argparse.Namespace, stage: str, json_dir: Path, output_dir:
     stage_args.output_dir = output_dir
 
     grouped: dict[int, list[Path]] = {}
-    for path in pending:
+    for path in _progress(
+        pending,
+        disable=args.no_progress,
+        desc=f"{stage}: grouping by IDM count",
+        unit="scene",
+    ):
         grouped.setdefault(_idm_vehicle_count(path), []).append(path)
 
-    for idm_count in sorted(grouped):
-        group = grouped[idm_count]
-        for start in range(0, len(group), args.batch_size):
-            batch = group[start : start + args.batch_size]
-            rows.extend(_run_worker(batch, stage_args))
-            _write_manifest(rows, output_dir)
-            print(f"[{stage}] [{len(rows)}/{len(pending)}] completed (idm_vehicle_count={idm_count})", flush=True)
+    progress = tqdm(
+        total=len(pending),
+        disable=args.no_progress,
+        desc=f"{stage}: rollout",
+        unit="scene",
+        dynamic_ncols=True,
+    )
+    try:
+        for idm_count in sorted(grouped):
+            group = grouped[idm_count]
+            for start in range(0, len(group), args.batch_size):
+                batch = group[start : start + args.batch_size]
+                progress.set_postfix(idm_vehicle_count=idm_count, batch=len(batch))
+                batch_rows = _run_worker(batch, stage_args)
+                rows.extend(batch_rows)
+                _write_manifest(rows, output_dir)
+                progress.update(len(batch_rows))
+                if args.no_progress:
+                    print(f"[{stage}] [{len(rows)}/{len(pending)}] completed (idm_vehicle_count={idm_count})", flush=True)
+    finally:
+        progress.close()
 
     if len(rows) != len(files):
         raise RuntimeError(f"Exported {len(rows)} trajectories for {len(files)} JSON files")

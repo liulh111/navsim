@@ -35,8 +35,36 @@ conda run -n gpudrive python navsim/scripts/run_navhard_stage_one_gpudrive_rollo
 
 第四步：评估结果
 
-conda run -n navsim python \
-navsim/navsim/planning/script/run_gpudrive_two_stage_pdm_score.py \
+1. 评测 Stage One
+
+conda run -n navsim python navsim/navsim/planning/script/run_gpudrive_two_stage_pdm_score.py \
+evaluation_stage=stage_one \
+stage_one_trajectory_dir=/data/llh/navsim_workspace/results/gpudrive_rollouts/navhard_two_stage/stage_one/zero_idm/trajectories \
+output_dir=/data/llh/navsim_workspace/results/pdm_score/gpudrive_zero_idm_stage_one
+
+2. 评测 Two-Stage
+
+conda run -n navsim python navsim/navsim/planning/script/run_gpudrive_two_stage_pdm_score.py \
+evaluation_stage=all \
 stage_one_trajectory_dir=/data/llh/navsim_workspace/results/gpudrive_rollouts/navhard_two_stage/stage_one/zero_idm/trajectories \
 stage_two_trajectory_dir=/data/llh/navsim_workspace/results/gpudrive_rollouts/navhard_two_stage/stage_two/zero_idm/trajectories \
 output_dir=/data/llh/navsim_workspace/results/pdm_score/gpudrive_zero_idm_two_stage
+
+3. 可视化 Stage One 评测结果
+
+把 <CSV> 换成上面 Stage One 评测输出目录里的 csv：
+
+conda run -n navsim python scripts/evaluation/visualize_pdm_rollout_cases.py \
+--stage stage1 \
+--quality worst \
+--num_scenes 20 \
+--csv_path /data/llh/navsim_workspace/results/pdm_score/gpudrive_zero_idm_stage_one/<CSV> \
+--sort_by score \
+--output_dir /data/llh/navsim_workspace/results/visualization/gpudrive_zero_idm_stage_one_worst \
+--config_name default_run_pdm_score \
+--agent offline_trajectory_agent \
+--override agent.trajectory_dir=/data/llh/navsim_workspace/results/gpudrive_rollouts/navhard_two_stage/stage_one/zero_idm/trajectories
+
+如果你用的是 expert_bicycle_idm，把所有 zero_idm 路径替换成：
+
+expert_bicycle_idm

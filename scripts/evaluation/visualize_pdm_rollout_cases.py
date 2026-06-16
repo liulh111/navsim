@@ -197,7 +197,7 @@ def select_rows(
     candidates = []
     for row in rows:
         token = row.get("token", "")
-        if token.startswith("extended_pdm_score"):
+        if token.startswith("extended_pdm_score") or token.startswith("average_pdm_score"):
             continue
         if parse_float(row.get(stage_marker)) is None:
             continue

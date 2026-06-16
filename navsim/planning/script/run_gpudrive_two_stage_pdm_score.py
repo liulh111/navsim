@@ -21,6 +21,7 @@ from nuplan.planning.script.builders.logging_builder import build_logger
 from nuplan.planning.simulation.trajectory.trajectory_sampling import TrajectorySampling
 from nuplan.planning.utils.multithreading.worker_utils import worker_map
 from omegaconf import DictConfig
+from tqdm import tqdm
 
 from navsim.common.dataclasses import PDMResults, SensorConfig, Trajectory
 from navsim.common.dataloader import MetricCacheLoader, SceneFilter, SceneLoader
@@ -32,6 +33,7 @@ from navsim.planning.script.run_pdm_score import (
     compute_final_scores,
     create_scene_aggregators,
 )
+from navsim.planning.simulation.planner.pdm_planner.scoring.scene_aggregator import SceneAggregator
 from navsim.planning.simulation.planner.pdm_planner.scoring.pdm_scorer import PDMScorer
 from navsim.planning.simulation.planner.pdm_planner.simulation.pdm_simulator import PDMSimulator
 from navsim.traffic_agents_policies.abstract_traffic_agents_policy import AbstractTrafficAgentsPolicy
@@ -40,16 +42,50 @@ logger = logging.getLogger(__name__)
 
 CONFIG_PATH = "config/pdm_scoring"
 CONFIG_NAME = "default_run_gpudrive_two_stage_pdm_score"
+EVALUATION_STAGES = {"all", "stage_one", "stage_two"}
+INTERNAL_SCORE_COLUMNS = {"multiplicative_metrics_prod", "weighted_metrics", "weighted_metrics_array", "pdm_score"}
 
 
-def _trajectory_tokens(trajectory_dir: Path) -> set[str]:
+def _validate_evaluation_stage(evaluation_stage: str) -> None:
+    if evaluation_stage not in EVALUATION_STAGES:
+        raise ValueError(f"evaluation_stage must be one of {sorted(EVALUATION_STAGES)}, got {evaluation_stage}")
+
+
+def _stage_enabled(evaluation_stage: str, stage: str) -> bool:
+    return evaluation_stage == "all" or evaluation_stage == stage
+
+
+def _show_progress(cfg: DictConfig) -> bool:
+    return bool(cfg.get("show_progress", True))
+
+
+def _progress(iterable: Iterable, *, enabled: bool, **kwargs):
+    return tqdm(iterable, disable=not enabled, dynamic_ncols=True, **kwargs)
+
+
+def _trajectory_tokens(trajectory_dir: Path, *, show_progress: bool = False, desc: str | None = None) -> set[str]:
     if not trajectory_dir.is_dir():
         raise FileNotFoundError(f"Trajectory directory does not exist: {trajectory_dir}")
-    return {path.stem for path in trajectory_dir.glob("*.npy")}
+    files = sorted(trajectory_dir.glob("*.npy"))
+    return {
+        path.stem
+        for path in _progress(
+            files,
+            enabled=show_progress,
+            desc=desc or f"scanning {trajectory_dir.name}",
+            unit="file",
+        )
+    }
 
 
-def _check_missing_trajectories(stage_name: str, expected_tokens: set[str], trajectory_dir: Path) -> set[str]:
-    available_tokens = _trajectory_tokens(trajectory_dir)
+def _check_missing_trajectories(
+    stage_name: str, expected_tokens: set[str], trajectory_dir: Path, *, show_progress: bool = False
+) -> set[str]:
+    available_tokens = _trajectory_tokens(
+        trajectory_dir,
+        show_progress=show_progress,
+        desc=f"checking {stage_name} trajectories",
+    )
     missing_tokens = sorted(expected_tokens - available_tokens)
     if missing_tokens:
         examples = ", ".join(missing_tokens[:10])
@@ -124,6 +160,7 @@ def run_gpudrive_two_stage_pdm_score(args: List[Dict[str, Union[List[str], DictC
     allowed_stage_one_tokens = {t for a in args for t in a["stage_one_tokens"]}
     allowed_stage_two_tokens = {t for a in args for t in a["stage_two_tokens"]}
     cfg: DictConfig = args[0]["cfg"]
+    show_progress = _show_progress(cfg)
 
     simulator: PDMSimulator = instantiate(cfg.simulator)
     scorer: PDMScorer = instantiate(cfg.scorer)
@@ -145,66 +182,100 @@ def run_gpudrive_two_stage_pdm_score(args: List[Dict[str, Union[List[str], DictC
     )
 
     trajectory_sampling: TrajectorySampling = instantiate(cfg.trajectory_sampling)
-    stage_one_dir = Path(cfg.stage_one_trajectory_dir)
-    stage_two_dir = Path(cfg.stage_two_trajectory_dir)
+    stage_one_dir = Path(cfg.stage_one_trajectory_dir) if allowed_stage_one_tokens else None
+    stage_two_dir = Path(cfg.stage_two_trajectory_dir) if allowed_stage_two_tokens else None
     metric_tokens = set(metric_cache_loader.tokens)
     pdm_results: List[pd.DataFrame] = []
 
-    traffic_agents_policy_stage_one: AbstractTrafficAgentsPolicy = instantiate(
-        cfg.traffic_agents_policy.reactive, simulator.proposal_sampling
-    )
-    tokens_to_evaluate_stage_one = sorted(set(scene_loader.tokens_stage_one) & metric_tokens & allowed_stage_one_tokens)
-    for idx, token in enumerate(tokens_to_evaluate_stage_one):
-        logger.info(
-            f"Processing stage one GPUDrive scenario {idx + 1} / {len(tokens_to_evaluate_stage_one)} "
-            f"in thread_id={thread_id}, node_id={node_id}"
+    if allowed_stage_one_tokens:
+        traffic_agents_policy_stage_one: AbstractTrafficAgentsPolicy = instantiate(
+            cfg.traffic_agents_policy.reactive, simulator.proposal_sampling
         )
-        try:
-            score_row_stage_one = _score_token(
-                token,
-                stage_one_dir,
-                trajectory_sampling,
-                metric_cache_loader,
-                simulator,
-                scorer,
-                traffic_agents_policy_stage_one,
-            )
-        except Exception:
-            logger.warning(f"----------- GPUDrive stage one trajectory failed for token {token}:")
-            traceback.print_exc()
-            score_row_stage_one = pd.DataFrame([PDMResults.get_empty_results()])
-            score_row_stage_one["valid"] = False
-            score_row_stage_one["token"] = token
-        pdm_results.append(score_row_stage_one)
+        tokens_to_evaluate_stage_one = sorted(
+            set(scene_loader.tokens_stage_one) & metric_tokens & allowed_stage_one_tokens
+        )
+        stage_one_iter = _progress(
+            enumerate(tokens_to_evaluate_stage_one),
+            enabled=show_progress,
+            total=len(tokens_to_evaluate_stage_one),
+            desc=f"stage one scoring node={node_id}",
+            unit="scene",
+            leave=False,
+        )
+        for idx, token in stage_one_iter:
+            if not show_progress:
+                logger.info(
+                    f"Processing stage one GPUDrive scenario {idx + 1} / {len(tokens_to_evaluate_stage_one)} "
+                    f"in thread_id={thread_id}, node_id={node_id}"
+                )
+            else:
+                stage_one_iter.set_postfix_str(token[:8])
+            try:
+                score_row_stage_one = (
+                    _score_token(
+                        token,
+                        stage_one_dir,
+                        trajectory_sampling,
+                        metric_cache_loader,
+                        simulator,
+                        scorer,
+                        traffic_agents_policy_stage_one,
+                    )
+                    if stage_one_dir is not None
+                    else pd.DataFrame([PDMResults.get_empty_results()])
+                )
+            except Exception:
+                logger.warning(f"----------- GPUDrive stage one trajectory failed for token {token}:")
+                traceback.print_exc()
+                score_row_stage_one = pd.DataFrame([PDMResults.get_empty_results()])
+                score_row_stage_one["valid"] = False
+                score_row_stage_one["token"] = token
+            pdm_results.append(score_row_stage_one)
 
-    traffic_agents_policy_stage_two: AbstractTrafficAgentsPolicy = instantiate(
-        cfg.traffic_agents_policy.reactive, simulator.proposal_sampling
-    )
-    tokens_to_evaluate_stage_two = sorted(
-        set(scene_loader.reactive_tokens_stage_two) & metric_tokens & allowed_stage_two_tokens
-    )
-    for idx, token in enumerate(tokens_to_evaluate_stage_two):
-        logger.info(
-            f"Processing stage two GPUDrive scenario {idx + 1} / {len(tokens_to_evaluate_stage_two)} "
-            f"in thread_id={thread_id}, node_id={node_id}"
+    if allowed_stage_two_tokens:
+        traffic_agents_policy_stage_two: AbstractTrafficAgentsPolicy = instantiate(
+            cfg.traffic_agents_policy.reactive, simulator.proposal_sampling
         )
-        try:
-            score_row_stage_two = _score_token(
-                token,
-                stage_two_dir,
-                trajectory_sampling,
-                metric_cache_loader,
-                simulator,
-                scorer,
-                traffic_agents_policy_stage_two,
-            )
-        except Exception:
-            logger.warning(f"----------- GPUDrive stage two trajectory failed for token {token}:")
-            traceback.print_exc()
-            score_row_stage_two = pd.DataFrame([PDMResults.get_empty_results()])
-            score_row_stage_two["valid"] = False
-            score_row_stage_two["token"] = token
-        pdm_results.append(score_row_stage_two)
+        tokens_to_evaluate_stage_two = sorted(
+            set(scene_loader.reactive_tokens_stage_two) & metric_tokens & allowed_stage_two_tokens
+        )
+        stage_two_iter = _progress(
+            enumerate(tokens_to_evaluate_stage_two),
+            enabled=show_progress,
+            total=len(tokens_to_evaluate_stage_two),
+            desc=f"stage two scoring node={node_id}",
+            unit="scene",
+            leave=False,
+        )
+        for idx, token in stage_two_iter:
+            if not show_progress:
+                logger.info(
+                    f"Processing stage two GPUDrive scenario {idx + 1} / {len(tokens_to_evaluate_stage_two)} "
+                    f"in thread_id={thread_id}, node_id={node_id}"
+                )
+            else:
+                stage_two_iter.set_postfix_str(token[:8])
+            try:
+                score_row_stage_two = (
+                    _score_token(
+                        token,
+                        stage_two_dir,
+                        trajectory_sampling,
+                        metric_cache_loader,
+                        simulator,
+                        scorer,
+                        traffic_agents_policy_stage_two,
+                    )
+                    if stage_two_dir is not None
+                    else pd.DataFrame([PDMResults.get_empty_results()])
+                )
+            except Exception:
+                logger.warning(f"----------- GPUDrive stage two trajectory failed for token {token}:")
+                traceback.print_exc()
+                score_row_stage_two = pd.DataFrame([PDMResults.get_empty_results()])
+                score_row_stage_two["valid"] = False
+                score_row_stage_two["token"] = token
+            pdm_results.append(score_row_stage_two)
 
     return pdm_results
 
@@ -214,10 +285,17 @@ def _build_data_points(
     stage_one_tokens: set[str],
     stage_two_tokens: set[str],
     tokens_by_log: Dict[str, List[str]],
+    *,
+    show_progress: bool = False,
 ) -> List[Dict[str, Union[List[str], DictConfig]]]:
     data_points: List[Dict[str, Union[List[str], DictConfig]]] = []
     tokens_to_evaluate = stage_one_tokens | stage_two_tokens
-    for log_file, tokens_list in tokens_by_log.items():
+    for log_file, tokens_list in _progress(
+        list(tokens_by_log.items()),
+        enabled=show_progress,
+        desc="building scoring jobs",
+        unit="log",
+    ):
         selected_tokens = sorted(set(tokens_list) & tokens_to_evaluate)
         if selected_tokens:
             data_points.append(
@@ -242,6 +320,88 @@ def _make_mapping(
         if orig_token in scored_tokens and prev_token in scored_tokens and pair_tokens <= scored_tokens:
             all_mappings[(orig_token, prev_token)] = pairs
     return all_mappings
+
+
+def _make_single_stage_pairs(
+    raw_mapping: Iterable[Tuple[str, str, Iterable[Iterable[str]]]], scored_tokens: set[str], evaluation_stage: str
+) -> List[Tuple[str, str]]:
+    pairs: List[Tuple[str, str]] = []
+    for orig_token, prev_token, two_stage_pairs in raw_mapping:
+        if evaluation_stage == "stage_one":
+            if orig_token in scored_tokens and prev_token in scored_tokens:
+                pairs.append((orig_token, prev_token))
+        elif evaluation_stage == "stage_two":
+            pairs.extend(
+                (now_token, prev_token)
+                for now_token, prev_token in (tuple(pair) for pair in two_stage_pairs)
+                if now_token in scored_tokens and prev_token in scored_tokens
+            )
+        else:
+            raise ValueError(f"single-stage pairs are only defined for stage_one/stage_two, got {evaluation_stage}")
+    return pairs
+
+
+def _drop_internal_score_columns(pdm_score_df: pd.DataFrame) -> pd.DataFrame:
+    return pdm_score_df.drop(columns=[c for c in INTERNAL_SCORE_COLUMNS if c in pdm_score_df.columns])
+
+
+def _compute_single_stage_two_frame_scores(
+    pdm_score_df: pd.DataFrame,
+    single_stage_pairs: List[Tuple[str, str]],
+    proposal_sampling: TrajectorySampling,
+) -> pd.DataFrame:
+    if not single_stage_pairs:
+        logger.warning("No single-stage frame pairs are available; keeping original PDM scores without two-frame comfort.")
+        pdm_score_df["weight"] = 1.0
+        pdm_score_df["two_frame_extended_comfort"] = np.nan
+        if "score" not in pdm_score_df.columns and "pdm_score" in pdm_score_df.columns:
+            pdm_score_df["score"] = pdm_score_df["pdm_score"]
+        return _drop_internal_score_columns(pdm_score_df)
+
+    full_score_df = pdm_score_df.copy()
+    full_score_df["two_frame_extended_comfort"] = np.nan
+    full_score_df["weight"] = 1.0
+    score_df_by_token = full_score_df.set_index("token")
+
+    updates = []
+    for now_token, prev_token in single_stage_pairs:
+        aggregator = SceneAggregator(
+            now_frame=now_token,
+            previous_frame=prev_token,
+            score_df=score_df_by_token,
+            proposal_sampling=proposal_sampling,
+        )
+        now_update = aggregator.aggregate_scores(one_stage_only=True).iloc[0]
+        comfort = now_update["two_frame_extended_comfort"]
+        updates.append({"token": now_token, "two_frame_extended_comfort": comfort, "weight": 1.0})
+        updates.append({"token": prev_token, "two_frame_extended_comfort": comfort, "weight": 1.0})
+
+    updates_df = pd.DataFrame(updates).drop_duplicates(subset=["token"], keep="last").set_index("token")
+    score_df_by_token.update(updates_df)
+    full_score_df = score_df_by_token.reset_index()
+
+    complete_mask = full_score_df["two_frame_extended_comfort"].notna()
+    if not bool(complete_mask.all()):
+        missing_tokens = sorted(full_score_df.loc[~complete_mask, "token"].astype(str).tolist())
+        logger.warning(
+            "Missing two-frame comfort for %d single-stage tokens. "
+            "These rows keep original PDM scores and will have NaN two-frame comfort. Examples: %s",
+            len(missing_tokens),
+            ", ".join(missing_tokens[:10]),
+        )
+
+    complete_df = full_score_df.loc[complete_mask].copy()
+    incomplete_df = full_score_df.loc[~complete_mask].copy()
+    output_frames: List[pd.DataFrame] = []
+
+    if not complete_df.empty:
+        output_frames.append(compute_final_scores(complete_df))
+    if not incomplete_df.empty:
+        if "score" not in incomplete_df.columns and "pdm_score" in incomplete_df.columns:
+            incomplete_df["score"] = incomplete_df["pdm_score"]
+        output_frames.append(_drop_internal_score_columns(incomplete_df))
+
+    return pd.concat(output_frames, ignore_index=True)
 
 
 def _format_metric_table(pdm_score_df: pd.DataFrame) -> str:
@@ -316,10 +476,55 @@ def _format_metric_table(pdm_score_df: pd.DataFrame) -> str:
     return table.to_string(float_format=lambda value: f"{value:.4f}" if np.isfinite(value) else "nan")
 
 
+def _score_columns(pdm_score_df: pd.DataFrame) -> list[str]:
+    return [
+        c
+        for c in pdm_score_df.columns
+        if (
+            (any(score.name in c for score in fields(PDMResults)) or c == "two_frame_extended_comfort" or c == "score")
+            and c not in INTERNAL_SCORE_COLUMNS
+        )
+    ]
+
+
+def _add_stage_columns(pdm_score_df: pd.DataFrame, score_cols: list[str]) -> pd.DataFrame:
+    for col in score_cols:
+        stage_one_mask = pdm_score_df["frame_type"] == SceneFrameType.ORIGINAL
+        stage_two_mask = pdm_score_df["frame_type"] == SceneFrameType.SYNTHETIC
+        pdm_score_df.loc[stage_one_mask, f"{col}_stage_one"] = pdm_score_df.loc[stage_one_mask, col]
+        pdm_score_df.loc[stage_two_mask, f"{col}_stage_two"] = pdm_score_df.loc[stage_two_mask, col]
+
+    pdm_score_df.drop(columns=score_cols, inplace=True)
+    for stage_score_col in ["score_stage_one", "score_stage_two"]:
+        if stage_score_col not in pdm_score_df.columns:
+            pdm_score_df[stage_score_col] = np.nan
+    pdm_score_df["score"] = pdm_score_df["score_stage_one"].combine_first(pdm_score_df["score_stage_two"])
+    pdm_score_df.drop(columns=["score_stage_one", "score_stage_two"], inplace=True)
+
+    stage1_cols = [f"{col}_stage_one" for col in score_cols if col != "score"]
+    stage2_cols = [f"{col}_stage_two" for col in score_cols if col != "score"]
+    return pdm_score_df[["token", "valid"] + stage1_cols + stage2_cols + ["score"]]
+
+
+def _append_single_stage_average(pdm_score_df: pd.DataFrame, evaluation_stage: str) -> pd.DataFrame:
+    stage_suffix = evaluation_stage
+    stage_cols = [col for col in pdm_score_df.columns if col.endswith(f"_{stage_suffix}")]
+    average_cols = stage_cols + ["score"]
+    average_row = pd.Series(index=pdm_score_df.columns, dtype=object)
+    average_row["token"] = f"average_pdm_score_{stage_suffix}"
+    average_row["valid"] = bool(pdm_score_df["valid"].all())
+    for col in average_cols:
+        average_row[col] = pd.to_numeric(pdm_score_df[col], errors="coerce").mean(skipna=True)
+    return pd.concat([pdm_score_df, pd.DataFrame([average_row])], ignore_index=True)
+
+
 @hydra.main(config_path=CONFIG_PATH, config_name=CONFIG_NAME, version_base=None)
 def main(cfg: DictConfig) -> None:
     build_logger(cfg)
     worker = build_worker(cfg)
+    evaluation_stage = str(cfg.evaluation_stage)
+    show_progress = _show_progress(cfg)
+    _validate_evaluation_stage(evaluation_stage)
 
     scene_loader = SceneLoader(
         synthetic_sensor_path=None,
@@ -332,18 +537,46 @@ def main(cfg: DictConfig) -> None:
     metric_cache_loader = MetricCacheLoader(Path(cfg.metric_cache_path))
     metric_tokens = set(metric_cache_loader.tokens)
 
-    stage_one_tokens = set(scene_loader.tokens_stage_one) & metric_tokens
-    stage_two_tokens = set(scene_loader.reactive_tokens_stage_two) & metric_tokens
-    scene_tokens = set(scene_loader.tokens)
+    stage_one_expected_tokens = set(scene_loader.tokens_stage_one) if _stage_enabled(evaluation_stage, "stage_one") else set()
+    stage_two_expected_tokens = (
+        set(scene_loader.reactive_tokens_stage_two) if _stage_enabled(evaluation_stage, "stage_two") else set()
+    )
+    stage_one_tokens = stage_one_expected_tokens & metric_tokens
+    stage_two_tokens = stage_two_expected_tokens & metric_tokens
+    scene_tokens = stage_one_expected_tokens | stage_two_expected_tokens
 
-    stage_one_dir = Path(cfg.stage_one_trajectory_dir)
-    stage_two_dir = Path(cfg.stage_two_trajectory_dir)
+    stage_one_dir = Path(cfg.stage_one_trajectory_dir) if _stage_enabled(evaluation_stage, "stage_one") else None
+    stage_two_dir = Path(cfg.stage_two_trajectory_dir) if _stage_enabled(evaluation_stage, "stage_two") else None
     if cfg.strict_trajectory_files:
-        stage_one_available_tokens = _check_missing_trajectories("stage one", stage_one_tokens, stage_one_dir)
-        stage_two_available_tokens = _check_missing_trajectories("stage two", stage_two_tokens, stage_two_dir)
+        stage_one_available_tokens = (
+            _check_missing_trajectories("stage one", stage_one_tokens, stage_one_dir, show_progress=show_progress)
+            if stage_one_dir is not None
+            else set()
+        )
+        stage_two_available_tokens = (
+            _check_missing_trajectories("stage two", stage_two_tokens, stage_two_dir, show_progress=show_progress)
+            if stage_two_dir is not None
+            else set()
+        )
     else:
-        stage_one_available_tokens = _trajectory_tokens(stage_one_dir)
-        stage_two_available_tokens = _trajectory_tokens(stage_two_dir)
+        stage_one_available_tokens = (
+            _trajectory_tokens(
+                stage_one_dir,
+                show_progress=show_progress,
+                desc="scanning available stage one trajectories",
+            )
+            if stage_one_dir is not None
+            else set()
+        )
+        stage_two_available_tokens = (
+            _trajectory_tokens(
+                stage_two_dir,
+                show_progress=show_progress,
+                desc="scanning available stage two trajectories",
+            )
+            if stage_two_dir is not None
+            else set()
+        )
         logger.warning(
             "strict_trajectory_files=false: evaluating only tokens with available GPUDrive trajectories. "
             f"Missing stage one: {len(stage_one_tokens - stage_one_available_tokens)}, "
@@ -362,46 +595,61 @@ def main(cfg: DictConfig) -> None:
         logger.warning(f"Unused metric cache for {num_unused_metric_cache_tokens} tokens. Skipping these tokens.")
 
     logger.info(
-        "Starting GPUDrive two-stage PDM scoring of "
+        f"Starting GPUDrive {evaluation_stage} PDM scoring of "
         f"{len(stage_one_eval_tokens)} stage one and {len(stage_two_eval_tokens)} stage two scenarios..."
     )
     data_points = _build_data_points(
-        cfg, stage_one_eval_tokens, stage_two_eval_tokens, scene_loader.get_tokens_list_per_log()
+        cfg,
+        stage_one_eval_tokens,
+        stage_two_eval_tokens,
+        scene_loader.get_tokens_list_per_log(),
+        show_progress=show_progress,
     )
+    if not data_points:
+        raise RuntimeError(
+            f"No GPUDrive {evaluation_stage} PDM scoring jobs were built. "
+            "Check evaluation_stage, trajectory directories, and scene filter tokens."
+        )
+    logger.info(f"Built {len(data_points)} GPUDrive PDM scoring jobs.")
     score_rows: List[pd.DataFrame] = worker_map(worker, run_gpudrive_two_stage_pdm_score, data_points)
     pdm_score_df = pd.concat(score_rows, ignore_index=True)
 
-    scored_tokens = set(pdm_score_df["token"])
-    all_mappings = _make_mapping(cfg.train_test_split.reactive_all_mapping, scored_tokens)
-    try:
-        if not all_mappings:
-            raise ValueError("No complete two-stage mappings are available for the evaluated tokens.")
-        pdm_score_df = create_scene_aggregators(
-            all_mappings, pdm_score_df, instantiate(cfg.simulator.proposal_sampling)
+    all_mappings: Dict[Tuple[str, str], List[Tuple[str, str]]] = {}
+    pseudo_closed_loop_valid = False
+    if evaluation_stage == "all":
+        scored_tokens = set(pdm_score_df["token"])
+        all_mappings = _make_mapping(cfg.train_test_split.reactive_all_mapping, scored_tokens)
+        try:
+            if not all_mappings:
+                raise ValueError("No complete two-stage mappings are available for the evaluated tokens.")
+            pdm_score_df = create_scene_aggregators(
+                all_mappings, pdm_score_df, instantiate(cfg.simulator.proposal_sampling)
+            )
+            pdm_score_df = compute_final_scores(pdm_score_df)
+            pseudo_closed_loop_valid = True
+        except Exception:
+            logger.warning("----------- Failed to calculate pseudo closed-loop weights or comfort:")
+            traceback.print_exc()
+            pdm_score_df["weight"] = 1.0
+            pdm_score_df["two_frame_extended_comfort"] = np.nan
+            if "score" not in pdm_score_df.columns and "pdm_score" in pdm_score_df.columns:
+                pdm_score_df["score"] = pdm_score_df["pdm_score"]
+    else:
+        scored_tokens = set(pdm_score_df["token"])
+        single_stage_pairs = _make_single_stage_pairs(
+            cfg.train_test_split.reactive_all_mapping, scored_tokens, evaluation_stage
         )
-        pdm_score_df = compute_final_scores(pdm_score_df)
-        pseudo_closed_loop_valid = True
-    except Exception:
-        logger.warning("----------- Failed to calculate pseudo closed-loop weights or comfort:")
-        traceback.print_exc()
-        pdm_score_df["weight"] = 1.0
-        pdm_score_df["two_frame_extended_comfort"] = np.nan
-        if "score" not in pdm_score_df.columns and "pdm_score" in pdm_score_df.columns:
-            pdm_score_df["score"] = pdm_score_df["pdm_score"]
-        pseudo_closed_loop_valid = False
+        pdm_score_df = _compute_single_stage_two_frame_scores(
+            pdm_score_df,
+            single_stage_pairs,
+            instantiate(cfg.simulator.proposal_sampling),
+        )
 
     num_sucessful_scenarios = pdm_score_df["valid"].sum()
     num_failed_scenarios = len(pdm_score_df) - num_sucessful_scenarios
     failed_tokens = pdm_score_df[~pdm_score_df["valid"]]["token"].to_list() if num_failed_scenarios > 0 else []
 
-    score_cols = [
-        c
-        for c in pdm_score_df.columns
-        if (
-            (any(score.name in c for score in fields(PDMResults)) or c == "two_frame_extended_comfort" or c == "score")
-            and c != "pdm_score"
-        )
-    ]
+    score_cols = _score_columns(pdm_score_df)
 
     if all_mappings:
         pcl_group_score, pcl_stage1_score, pcl_stage2_score = calculate_individual_mapping_scores(
@@ -413,56 +661,43 @@ def main(cfg: DictConfig) -> None:
         pcl_stage1_score = empty_scores
         pcl_stage2_score = empty_scores
 
-    for col in score_cols:
-        stage_one_mask = pdm_score_df["frame_type"] == SceneFrameType.ORIGINAL
-        stage_two_mask = pdm_score_df["frame_type"] == SceneFrameType.SYNTHETIC
-        pdm_score_df.loc[stage_one_mask, f"{col}_stage_one"] = pdm_score_df.loc[stage_one_mask, col]
-        pdm_score_df.loc[stage_two_mask, f"{col}_stage_two"] = pdm_score_df.loc[stage_two_mask, col]
-
-    pdm_score_df.drop(columns=score_cols, inplace=True)
-    for stage_score_col in ["score_stage_one", "score_stage_two"]:
-        if stage_score_col not in pdm_score_df.columns:
-            pdm_score_df[stage_score_col] = np.nan
-    pdm_score_df["score"] = pdm_score_df["score_stage_one"].combine_first(pdm_score_df["score_stage_two"])
-    pdm_score_df.drop(columns=["score_stage_one", "score_stage_two"], inplace=True)
-
-    stage1_cols = [f"{col}_stage_one" for col in score_cols if col != "score"]
-    stage2_cols = [f"{col}_stage_two" for col in score_cols if col != "score"]
-    final_score_cols = stage1_cols + stage2_cols + ["score"]
-    pdm_score_df = pdm_score_df[["token", "valid"] + final_score_cols]
+    pdm_score_df = _add_stage_columns(pdm_score_df, score_cols)
 
     summary_rows = []
-    stage1_row = pd.Series(index=pdm_score_df.columns, dtype=object)
-    stage1_row["token"] = "extended_pdm_score_stage_one"
-    stage1_row["valid"] = pseudo_closed_loop_valid
-    stage1_row["score"] = pcl_stage1_score.get("score", np.nan)
-    for col in pcl_stage1_score.index:
-        if col not in ["token", "valid", "score"]:
-            stage1_row[f"{col}_stage_one"] = pcl_stage1_score[col]
-    summary_rows.append(stage1_row)
+    if evaluation_stage == "all":
+        stage1_row = pd.Series(index=pdm_score_df.columns, dtype=object)
+        stage1_row["token"] = "extended_pdm_score_stage_one"
+        stage1_row["valid"] = pseudo_closed_loop_valid
+        stage1_row["score"] = pcl_stage1_score.get("score", np.nan)
+        for col in pcl_stage1_score.index:
+            if col not in ["token", "valid", "score"]:
+                stage1_row[f"{col}_stage_one"] = pcl_stage1_score[col]
+        summary_rows.append(stage1_row)
 
-    stage2_row = pd.Series(index=pdm_score_df.columns, dtype=object)
-    stage2_row["token"] = "extended_pdm_score_stage_two"
-    stage2_row["valid"] = pseudo_closed_loop_valid
-    stage2_row["score"] = pcl_stage2_score.get("score", np.nan)
-    for col in pcl_stage2_score.index:
-        if col not in ["token", "valid", "score"]:
-            stage2_row[f"{col}_stage_two"] = pcl_stage2_score[col]
-    summary_rows.append(stage2_row)
+        stage2_row = pd.Series(index=pdm_score_df.columns, dtype=object)
+        stage2_row["token"] = "extended_pdm_score_stage_two"
+        stage2_row["valid"] = pseudo_closed_loop_valid
+        stage2_row["score"] = pcl_stage2_score.get("score", np.nan)
+        for col in pcl_stage2_score.index:
+            if col not in ["token", "valid", "score"]:
+                stage2_row[f"{col}_stage_two"] = pcl_stage2_score[col]
+        summary_rows.append(stage2_row)
 
-    combined_row = pd.Series(index=pdm_score_df.columns, dtype=object)
-    combined_row["token"] = "extended_pdm_score_combined"
-    combined_row["valid"] = pseudo_closed_loop_valid
-    combined_row["score"] = pcl_group_score["score"]
-    for col in pcl_stage1_score.index:
-        if col not in ["token", "valid", "score"]:
-            combined_row[f"{col}_stage_one"] = pcl_stage1_score[col]
-    for col in pcl_stage2_score.index:
-        if col not in ["token", "valid", "score"]:
-            combined_row[f"{col}_stage_two"] = pcl_stage2_score[col]
-    summary_rows.append(combined_row)
+        combined_row = pd.Series(index=pdm_score_df.columns, dtype=object)
+        combined_row["token"] = "extended_pdm_score_combined"
+        combined_row["valid"] = pseudo_closed_loop_valid
+        combined_row["score"] = pcl_group_score["score"]
+        for col in pcl_stage1_score.index:
+            if col not in ["token", "valid", "score"]:
+                combined_row[f"{col}_stage_one"] = pcl_stage1_score[col]
+        for col in pcl_stage2_score.index:
+            if col not in ["token", "valid", "score"]:
+                combined_row[f"{col}_stage_two"] = pcl_stage2_score[col]
+        summary_rows.append(combined_row)
 
-    pdm_score_df = pd.concat([pdm_score_df, pd.DataFrame(summary_rows)], ignore_index=True)
+        pdm_score_df = pd.concat([pdm_score_df, pd.DataFrame(summary_rows)], ignore_index=True)
+    else:
+        pdm_score_df = _append_single_stage_average(pdm_score_df, evaluation_stage)
 
     save_path = Path(cfg.output_dir)
     save_path.mkdir(parents=True, exist_ok=True)
@@ -476,7 +711,7 @@ def main(cfg: DictConfig) -> None:
         Finished running GPUDrive two-stage evaluation.
             Number of successful scenarios: {num_sucessful_scenarios}.
             Number of failed scenarios: {num_failed_scenarios}.
-            Final extended pdm score of valid results: {pdm_score_df[pdm_score_df["token"] == "extended_pdm_score_combined"]["score"].iloc[0]}.
+            Final pdm score of valid results: {pd.to_numeric(pdm_score_df["score"], errors="coerce").mean(skipna=True)}.
             Results are stored in: {result_path}.
 
         Metric summary:
